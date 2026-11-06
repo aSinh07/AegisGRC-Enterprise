@@ -14,6 +14,19 @@ for key in "${required[@]}"; do
 done
 
 [ "$(grep -E '^NODE_ENV=' .env.production | tail -1 | cut -d= -f2- || true)" = "production" ] || { echo "NODE_ENV must be production"; exit 1; }
+
+env_value(){ grep -E "^$1=" .env.production | tail -1 | cut -d= -f2- || true; }
+if [ -n "$(env_value MIGRATION_DATABASE_URL)" ]; then
+  for key in AEGIS_DB_RUNTIME_ROLE AEGIS_DB_RUNTIME_PASSWORD; do
+    value="$(env_value "$key")"; normalized="$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
+    if [ -z "$value" ] || [[ "$normalized" == REPLACE_* ]]; then echo "Missing or placeholder production secret: $key"; exit 1; fi
+  done
+  runtime_user="$(env_value DATABASE_URL | sed -E 's#^[a-z]+://([^:@/]+).*#\1#')"
+  [ "$runtime_user" = "$(env_value AEGIS_DB_RUNTIME_ROLE)" ] || { echo "DATABASE_URL must connect as AEGIS_DB_RUNTIME_ROLE (least-privilege runtime role)"; exit 1; }
+  [ "$runtime_user" != "$(env_value POSTGRES_USER)" ] || { echo "DATABASE_URL must not use the schema owner when MIGRATION_DATABASE_URL is set"; exit 1; }
+else
+  echo "WARNING: MIGRATION_DATABASE_URL is not set; the application runs as the schema owner and database triggers are not a hard control."
+fi
 [ "$(grep -E '^COOKIE_SECURE=' .env.production | tail -1 | cut -d= -f2- || true)" = "true" ] || { echo "COOKIE_SECURE must be true"; exit 1; }
 
 totp_key="$(grep -E '^TOTP_ENCRYPTION_KEY=' .env.production | tail -1 | cut -d= -f2- || true)"

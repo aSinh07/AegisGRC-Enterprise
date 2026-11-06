@@ -81,7 +81,9 @@ ALTER TABLE evidence ADD COLUMN IF NOT EXISTS integrity_verified_at timestamptz;
 --   BEGIN; SET LOCAL aegis.allow_evidence_purge='on'; DELETE ...; COMMIT;
 CREATE OR REPLACE FUNCTION aegis_forbid_evidence_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
- IF current_setting('aegis.allow_evidence_purge', true) = 'on' THEN
+ -- The purge override is honoured only for the table owner (migration role). A non-owner runtime
+ -- role can set the GUC but still cannot rewrite or delete evidence.
+ IF current_setting('aegis.allow_evidence_purge', true) = 'on' AND pg_has_role(current_user,(SELECT relowner FROM pg_class WHERE oid=TG_RELID),'MEMBER') THEN
   IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
   RETURN NEW;
  END IF;
@@ -103,7 +105,9 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS withdrawn_at timestamptz;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS withdrawn_by uuid;
 CREATE OR REPLACE FUNCTION aegis_protect_document_content() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
- IF current_setting('aegis.allow_evidence_purge', true) = 'on' THEN
+ -- The purge override is honoured only for the table owner (migration role). A non-owner runtime
+ -- role can set the GUC but still cannot rewrite or delete evidence.
+ IF current_setting('aegis.allow_evidence_purge', true) = 'on' AND pg_has_role(current_user,(SELECT relowner FROM pg_class WHERE oid=TG_RELID),'MEMBER') THEN
   IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
   RETURN NEW;
  END IF;

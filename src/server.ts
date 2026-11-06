@@ -91,6 +91,7 @@ import {evidenceSigningKey,verifyEvidenceSignature} from './evidence-signing.js'
 import {pinnedAddress,withPinnedEgress,pinnedHttpGet} from './pinned-egress.js';
 import {scannerArgs,nucleiTemplatesPin} from './scanner-args.js';
 import {pool as dbPool} from './db-pool.js';
+import {runtimeManagesSchema,databaseRolePosture} from './schema-init.js';
 import {recordSignedReport,reportHeaders,verifyReportRecord,verifyReportBytes} from './report-records.js';
 import {requestTargetAuthorization,verifyTargetAuthorization,decideTargetAuthorization,revokeTargetAuthorization,listTargetAuthorizations,targetAuthorizationBasis,assertTargetAuthorized} from './target-authorization.js';
 import {verifyAuditChain,checkpointAuditChain,startAuditCheckpointer} from './audit-chain.js';
@@ -104,6 +105,8 @@ import { docxReport,pptxReport,xlsxReport,csvReport,txtReport,reportModel,framew
 
 const app=express();
 app.set('trust proxy',1);
+// DDL runs only when this process's database role owns the schema (see src/schema-init.ts).
+if(process.env.DATABASE_URL&&!await runtimeManagesSchema()){console.log('[AEGIS DB] runtime role does not own the schema; DDL initializers skipped (run npm run db:init as the migration role)')}else{
 await initUsers();
 await initGrcReviews();
 await initGrcCore();
@@ -135,6 +138,8 @@ await initOperationalSecurity();
 await initSecurityReportHandoffs();
 await initSecurityFindingProposals();
 await initScannerJobs();
+}
+if(process.env.DATABASE_URL){const posture=await databaseRolePosture();if(!posture.hardened){const msg='[AEGIS DB] runtime role '+posture.role+' is '+(posture.superuser?'a superuser':posture.ownsSchema?'the schema owner':'allowed to create objects')+'; database triggers are not a hard control for this role';if(String(process.env.AEGIS_REQUIRE_NON_OWNER_DB_ROLE||'').toLowerCase()==='true')throw new Error(msg);console.warn(msg)}}
 await recoverStaleScannerJobs();
 {const recovered=await recoverInterruptedAssessments([],0);if(recovered.length)console.warn('[AEGIS RECOVERY] marked '+recovered.length+' orphaned RUNNING assessment(s) INTERRUPTED');}
 evidenceSigningKey(); // fails closed in production without a real EVIDENCE_HMAC_KEY

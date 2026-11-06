@@ -29,4 +29,6 @@ ENV NODE_ENV=production
 ENV NUCLEI_TEMPLATES_DIR=/opt/nuclei-templates
 USER node
 EXPOSE 8080
-CMD ["sh","-c","if [ -n \"$DATABASE_URL\" ]; then npm run db:init; fi && npm start"]
+# Migrate as the schema owner (MIGRATION_DATABASE_URL when set), then run the app WITHOUT owner credentials:
+# exec env -u removes them from the long-running process environment.
+CMD ["sh","-c","if [ -n \"$DATABASE_URL\" ] || [ -n \"$MIGRATION_DATABASE_URL\" ]; then npm run db:init; fi && exec env -u MIGRATION_DATABASE_URL -u AEGIS_DB_RUNTIME_PASSWORD -u POSTGRES_PASSWORD npm start"]

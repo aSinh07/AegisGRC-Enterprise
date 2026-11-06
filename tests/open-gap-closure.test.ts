@@ -366,3 +366,44 @@ test('signed report issuance fails closed in production without a real key',asyn
  assert.throws(()=>rr.reportRecordKey({NODE_ENV:'production',REPORT_SIGNING_KEY:'replace-with-at-least-32-random-characters'} as any),/REPORT_SIGNING_KEY/);
  assert.equal(rr.reportRecordKey({NODE_ENV:'test'} as any),null);
 });
+
+// ── Gap: database triggers do not stop the owner/superuser runtime role ─────
+test('server DDL block and db:init run the same initializer list',async()=>{
+ const {RUNTIME_SCHEMA_INITIALIZERS}=await import('../src/schema-init.js');
+ const server=await readFile(new URL('../src/server.ts',import.meta.url),'utf8');
+ const start=server.indexOf('if(process.env.DATABASE_URL&&!await runtimeManagesSchema())'),end=server.indexOf('await recoverStaleScannerJobs();');
+ assert.ok(start>0&&end>start);
+ const inServer=[...server.slice(start,end).matchAll(/await (init\w+)\(\);/g)].map(m=>m[1]);
+ assert.deepEqual(inServer,[...RUNTIME_SCHEMA_INITIALIZERS]);
+ const init=await readFile(new URL('../scripts/init-db.ts',import.meta.url),'utf8');
+ assert.match(init,/await initRuntimeSchema\(\)/);assert.match(init,/process\.env\.DATABASE_URL=ownerUrl/);
+});
+test('least-privilege runtime role cannot rewrite evidence, bypass triggers or change the schema',{skip:!ciDb},async()=>{
+ const {execFileSync}=await import('node:child_process');
+ const role='aegis_app_t'+crypto.randomBytes(3).toString('hex'),password='rt-'+crypto.randomBytes(16).toString('hex');
+ execFileSync('npx',['tsx','scripts/init-db.ts'],{env:{...process.env,MIGRATION_DATABASE_URL:process.env.DATABASE_URL,AEGIS_DB_RUNTIME_ROLE:role,AEGIS_DB_RUNTIME_PASSWORD:password},stdio:'ignore'});
+ const u=new URL(process.env.DATABASE_URL!);u.username=role;u.password=password;
+ const app=new pg.Pool({connectionString:u.toString(),ssl:false});
+ const owner=new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:false});
+ try{
+  const posture=(await app.query(`SELECT (SELECT rolsuper FROM pg_roles WHERE rolname=current_user) su,has_schema_privilege(current_user,'public','CREATE') can_create`)).rows[0];
+  assert.equal(posture.su,false);assert.equal(posture.can_create,false);
+  const aid=crypto.randomUUID(),eid=crypto.randomUUID(),audit=crypto.randomUUID();
+  await app.query("INSERT INTO assessments(id,target,authorized_at,status,payload) VALUES($1,'https://example.com',now(),'RUNNING','{}')",[aid]);
+  await app.query("UPDATE assessments SET status='COMPLETED' WHERE id=$1",[aid]);
+  await app.query("INSERT INTO evidence(id,assessment_id,source,sha256,created_at,payload) VALUES($1,$2,'nmap',$3,now(),'{}')",[eid,aid,'a'.repeat(64)]);
+  await app.query("INSERT INTO audit_events(id,assessment_id,action,created_at,payload) VALUES($1,$2,'X',now(),'{}')",[audit,aid]);
+  assert.match((await app.query('SELECT entry_hash FROM audit_events WHERE id=$1',[audit])).rows[0].entry_hash,/^[0-9a-f]{64}$/,'audit chaining works for the runtime role');
+  // Even with the purge GUC set, the runtime role cannot mutate evidence or audit rows.
+  for(const stmt of ["UPDATE evidence SET sha256=repeat('b',64) WHERE id=$1","DELETE FROM evidence WHERE id=$1","UPDATE audit_events SET action='Y' WHERE id=$1","DELETE FROM audit_events WHERE id=$1"]){
+   const c=await app.connect();
+   try{await c.query('BEGIN');await c.query("SET LOCAL aegis.allow_evidence_purge='on'");await assert.rejects(c.query(stmt,[stmt.includes('evidence')?eid:audit]),/permission denied|append-only/,stmt)}finally{await c.query('ROLLBACK').catch(()=>{});c.release()}
+  }
+  for(const ddl of ['ALTER TABLE evidence DISABLE TRIGGER evidence_append_only','DROP TRIGGER audit_events_hash_chain ON audit_events','CREATE TABLE aegis_shadow(x int)','TRUNCATE audit_events','ALTER TABLE evidence ADD COLUMN x int'])
+   await assert.rejects(app.query(ddl),/must be owner|permission denied/,ddl);
+  // The documented owner-only purge path still works for the migration role.
+  const c=await owner.connect();
+  try{await c.query('BEGIN');await c.query("SET LOCAL aegis.allow_evidence_purge='on'");await c.query('DELETE FROM evidence WHERE id=$1',[eid]);await c.query('ROLLBACK')}finally{c.release()}
+  const {databaseRolePosture}=await import('../src/schema-init.js');assert.equal(typeof databaseRolePosture,'function');
+ }finally{await app.end();await owner.end()}
+});
