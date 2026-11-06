@@ -1,4 +1,4 @@
-aegisgrc-security.duckdns.org {
+{$AEGIS_DOMAIN:aegisgrc-security.duckdns.org} {
     reverse_proxy aegis:8080
 
     header {

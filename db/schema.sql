@@ -74,3 +74,55 @@ ALTER TABLE evidence ADD COLUMN IF NOT EXISTS integrity_verified_at timestamptz;
 -- SHA-256 format is enforced by application writes. The named database constraint may
 -- already exist from an earlier migration; do not recreate or drop it during startup.
 
+
+-- Evidence Vault immutability (architecture: "Hashed, Tenant Scoped, Immutable, Auditable").
+-- Scanner evidence and audit events are append-only at the database layer, not only by
+-- application convention. A deliberate, audited retention purge must opt in per transaction:
+--   BEGIN; SET LOCAL aegis.allow_evidence_purge='on'; DELETE ...; COMMIT;
+CREATE OR REPLACE FUNCTION aegis_forbid_evidence_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF current_setting('aegis.allow_evidence_purge', true) = 'on' THEN
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+ END IF;
+ RAISE EXCEPTION 'AegisGRC % is append-only: % is not permitted', TG_TABLE_NAME, TG_OP USING ERRCODE = 'insufficient_privilege';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS evidence_append_only ON evidence;
+CREATE TRIGGER evidence_append_only BEFORE UPDATE OR DELETE ON evidence FOR EACH ROW EXECUTE FUNCTION aegis_forbid_evidence_mutation();
+DROP TRIGGER IF EXISTS evidence_no_truncate ON evidence;
+CREATE TRIGGER evidence_no_truncate BEFORE TRUNCATE ON evidence FOR EACH STATEMENT EXECUTE FUNCTION aegis_forbid_evidence_mutation();
+DROP TRIGGER IF EXISTS audit_events_append_only ON audit_events;
+CREATE TRIGGER audit_events_append_only BEFORE UPDATE OR DELETE ON audit_events FOR EACH ROW EXECUTE FUNCTION aegis_forbid_evidence_mutation();
+DROP TRIGGER IF EXISTS audit_events_no_truncate ON audit_events;
+CREATE TRIGGER audit_events_no_truncate BEFORE TRUNCATE ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION aegis_forbid_evidence_mutation();
+
+-- Uploaded evidence documents are retained: "delete" is a soft withdrawal that keeps the bytes and hash.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS withdrawn_at timestamptz;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS withdrawn_by uuid;
+CREATE OR REPLACE FUNCTION aegis_protect_document_content() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF current_setting('aegis.allow_evidence_purge', true) = 'on' THEN
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+ END IF;
+ IF TG_OP = 'DELETE' THEN
+  RAISE EXCEPTION 'AegisGRC documents are retained evidence: use withdrawal, not DELETE' USING ERRCODE = 'insufficient_privilege';
+ END IF;
+ IF NEW.content IS DISTINCT FROM OLD.content OR NEW.sha256 IS DISTINCT FROM OLD.sha256 OR NEW.assessment_id IS DISTINCT FROM OLD.assessment_id
+    OR NEW.filename IS DISTINCT FROM OLD.filename OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    OR (OLD.withdrawn_at IS NOT NULL AND NEW.withdrawn_at IS DISTINCT FROM OLD.withdrawn_at) THEN
+  RAISE EXCEPTION 'AegisGRC document content, hash and withdrawal history are immutable' USING ERRCODE = 'insufficient_privilege';
+ END IF;
+ RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS documents_content_immutable ON documents;
+CREATE TRIGGER documents_content_immutable BEFORE UPDATE OR DELETE ON documents FOR EACH ROW EXECUTE FUNCTION aegis_protect_document_content();
+
+-- Deleting an assessment must not silently cascade away its evidence trail.
+ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_assessment_id_fkey;
+ALTER TABLE evidence ADD CONSTRAINT evidence_assessment_id_fkey FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE RESTRICT;
+ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_assessment_id_fkey;
+ALTER TABLE documents ADD CONSTRAINT documents_assessment_id_fkey FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE RESTRICT;

@@ -8,7 +8,7 @@ export interface Finding {
  confidence?:'OBSERVED'|'SCANNER_REPORTED'|'VALIDATED'|'CONFIRMED'; externalIds?:{cve?:string[];cwe?:string[];scannerId?:string}; fingerprint?:string;
 }
 export interface Assessment {
- id:string; target:string; authorizedAt:string; status:'AUTHORIZED'|'RUNNING'|'COMPLETED'|'PARTIAL'|'FAILED';
+ id:string; target:string; authorizedAt:string; status:'AUTHORIZED'|'RUNNING'|'COMPLETED'|'PARTIAL'|'FAILED'|'INTERRUPTED';
  findings:Finding[]; evidenceIds:string[];
  scanCoverage?:{required:string[];succeeded:string[];failed:string[];notRun:string[];complete:boolean};
 }

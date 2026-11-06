@@ -9,6 +9,18 @@ import {requireAssessmentAccess,requireOrgPermission} from './grc-organizations.
 export type FindingDecision='CONFIRMED'|'FALSE_POSITIVE'|'ACCEPTED'|'REMEDIATED';
 const decisions=new Set<FindingDecision>(['CONFIRMED','FALSE_POSITIVE','ACCEPTED','REMEDIATED']);
 
+// A killed process reports exitCode null and Number(null)===0, so the exit code must be
+// strictly the number 0. Timed-out or truncated output is incomplete evidence and can
+// never prove that a vulnerability is absent.
+export function retestEvidenceIsComplete(payload:any){
+ if(!payload||typeof payload!=='object')return false;
+ if(typeof payload.exitCode!=='number'||payload.exitCode!==0)return false;
+ const m=payload.metadata||{};
+ if(m.timedOut===true||m.stdoutTruncated===true||m.stderrTruncated===true||m.incomplete===true)return false;
+ if(payload.timedOut===true||payload.stdoutTruncated===true||payload.stderrTruncated===true)return false;
+ return true;
+}
+
 export async function initFindingReview(){
  await pool.query(`
  CREATE TABLE IF NOT EXISTS finding_reviews(
@@ -64,7 +76,7 @@ export async function reviewFinding(userId:string,assessmentId:string,findingId:
    if(!retestEvidenceId)throw Object.assign(new Error('REMEDIATED requires successful retest evidence'),{statusCode:409});
    const ev=(await client.query('SELECT id,source,created_at,payload FROM evidence WHERE id=$1 AND assessment_id=$2 FOR UPDATE',[retestEvidenceId,assessmentId])).rows[0];
    if(!ev)throw Object.assign(new Error('Retest evidence not found in this assessment'),{statusCode:409});
-   if(Number(ev.payload?.exitCode)!==0)throw Object.assign(new Error('Retest evidence must come from a successful tool execution'),{statusCode:409});
+   if(!retestEvidenceIsComplete(ev.payload))throw Object.assign(new Error('Retest evidence must come from a successful tool execution that completed (exit code 0, not timed out, not truncated)'),{statusCode:409});
    if(new Date(ev.created_at).getTime()<=new Date(original.createdAt).getTime())throw Object.assign(new Error('Retest evidence must be newer than the original finding'),{statusCode:409});
    if(String(ev.source)!==String(original.source))throw Object.assign(new Error('Retest evidence must use the same scanner source as the original finding'),{statusCode:409});
    const link=(await client.query('SELECT evidence_id,finding_id,fingerprint,scanner_source FROM finding_retests WHERE evidence_id=$1 AND assessment_id=$2',[retestEvidenceId,assessmentId])).rows[0];

@@ -1,4 +1,5 @@
 import PDFDocument from 'pdfkit';
+import {guardedDisposition} from './report-status.js';
 import type {Assessment,Finding,Evidence} from './models.js';
 
 const SEVERITIES=['CRITICAL','HIGH','MEDIUM','LOW','INFO'] as const;
@@ -79,8 +80,8 @@ export function renderDefensiveSecurityPdf(a:Assessment,fs:Finding[],ev:Evidence
  d.moveDown(.5);p('Residual exposure also includes accepted risk, unresolved findings, unobserved assets, scanner blind spots, and changes made after evidence collection.');
 
  h1('Management Conclusion');
- const disposition=critical||high?'REMEDIATION REQUIRED':open.length?'REMEDIATION / RETEST REQUIRED':'NO OPEN EVIDENCE-BACKED FINDINGS';
- d.rect(46,d.y,503,46).fill(critical||high?'#FCE8E6':'#E8F5E9');d.strokeColor(line).lineWidth(.6).rect(46,d.y,503,46).stroke();d.fillColor(critical||high?red:green).font('Times-Bold').fontSize(11).text(disposition,60,d.y+16,{width:475});d.y+=60;
+ const guarded=guardedDisposition(a.status,critical||high?'REMEDIATION REQUIRED':open.length?'REMEDIATION / RETEST REQUIRED':'NO OPEN EVIDENCE-BACKED FINDINGS',critical||high?'RED':open.length?'AMBER':'GREEN',open.length);const disposition=guarded.text;const dispositionFill=guarded.tone==='RED'?'#FCE8E6':guarded.tone==='AMBER'?'#FFF4E5':'#E8F5E9',dispositionInk=guarded.tone==='RED'?red:guarded.tone==='AMBER'?'#B54708':green;
+ d.rect(46,d.y,503,46).fill(dispositionFill);d.strokeColor(line).lineWidth(.6).rect(46,d.y,503,46).stroke();d.fillColor(dispositionInk).font('Times-Bold').fontSize(11).text(disposition,60,d.y+16,{width:475});d.y+=60;
  p('The conclusion is bounded by stored evidence and executed coverage. Findings must not be promoted to confirmed exploitation without evidence of impact. Unobserved surfaces and failed/not-run engines remain assurance limitations.');
 
  h1('Production Readiness: Defensive Controls Are Necessary but Not Sufficient');

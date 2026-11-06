@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 test -f .env.production || { echo ".env.production is required"; exit 1; }
 
-required=(POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB DATABASE_URL ASSESSMENT_SESSION_SECRET EVIDENCE_HMAC_KEY REPORT_SIGNING_KEY GRC_AUTOMATION_SECRET TOTP_ENCRYPTION_KEY)
+required=(POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB DATABASE_URL ASSESSMENT_SESSION_SECRET EVIDENCE_HMAC_KEY REPORT_SIGNING_KEY GRC_AUTOMATION_SECRET TOTP_ENCRYPTION_KEY ZAP_API_KEY)
 for key in "${required[@]}"; do
   value="$(grep -E "^${key}=" .env.production | tail -1 | cut -d= -f2- || true)"
   normalized="$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
@@ -47,6 +47,9 @@ echo "Deploying already checked-out release $release (deployment does not move G
 
 echo "Building application image only..."
 docker compose -f docker-compose.production.yml build aegis
+
+echo "Ensuring OWASP ZAP (required full-assessment engine) is running..."
+docker compose -f docker-compose.production.yml up -d --no-deps zap
 
 echo "Starting/updating AegisGRC only; PostgreSQL and other services are not restarted..."
 docker compose -f docker-compose.production.yml up -d --no-deps aegis
