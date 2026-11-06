@@ -21,6 +21,9 @@ Production-oriented GRC and authorized security-assessment platform.
 ## Safety / authorization
 Use only on systems you own or have explicit permission to assess. In production, a target must pass DNS/HTTP ownership verification and be approved by a second authorized user before any scan (see `docs/ARCHITECTURE_GAP_CLOSURE.md`). Scanners connect only to the validated, pinned address. Private, loopback, link-local, multicast and reserved destinations are blocked by default. Redirects and resolved addresses must remain in the authorized scope.
 
+## Target architecture
+The governed 12-step lifecycle, durable scan jobs with pull-based scanner workers, the hybrid deployment (Cloudflare Tunnel, cloud worker, encrypted backups) and the ISO 27001-based SoA with five control gates are described in `docs/TARGET_ARCHITECTURE_IMPLEMENTATION.md` and `docs/HYBRID_DEPLOYMENT.md`.
+
 ## Local development
 ```bash
 cp .env.example .env
