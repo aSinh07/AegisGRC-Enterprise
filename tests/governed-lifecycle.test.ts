@@ -234,3 +234,21 @@ test('fingerprint dedupe persists one lineage per organization across scanners a
   assert.deepEqual(row.sources,['nuclei','zap']);assert.equal(row.occurrences,2);
  }finally{await pool.end()}
 });
+
+// ── Hybrid deployment configuration ─────────────────────────────────────────
+import {readFile as rf} from 'node:fs/promises';
+test('hybrid deployment: tunnel and monitoring are opt-in, worker is pull-only and stores nothing, backups are encrypted',async()=>{
+ const prod=await rf(new URL('../docker-compose.production.yml',import.meta.url),'utf8');
+ assert.match(prod,/cloudflared:\n    image: cloudflare\/cloudflared:\d{4}\.\d+\.\d+\n    profiles: \["tunnel"\]/);
+ assert.match(prod,/--no-autoupdate/);
+ const tunnelBlock=prod.slice(prod.indexOf('  caddy-tunnel:'),prod.indexOf('  uptime-kuma:'));assert.doesNotMatch(tunnelBlock,/ports:/,'the edge publishes no host ports');
+ const worker=await rf(new URL('../docker-compose.worker.yml',import.meta.url),'utf8');
+ assert.doesNotMatch(worker,/ports:/);assert.doesNotMatch(worker,/DATABASE_URL/);assert.match(worker,/read_only: true/);assert.match(worker,/command: \["npm","run","worker"\]/);
+ assert.doesNotMatch(worker.replace(/tmpfs:[\s\S]*?(?=\n    \w)/g,''),/\n    volumes:/,'the worker mounts no persistent volumes');
+ const backup=await rf(new URL('../scripts/backup-encrypted.sh',import.meta.url),'utf8');
+ assert.match(backup,/pg_dump[^\n]*\| age -r "\$AGE_RECIPIENT"/,'plaintext dump is streamed straight into age');
+ assert.match(backup,/gcloud storage cp/);
+ const drill=await rf(new URL('../scripts/restore-drill-encrypted.sh',import.meta.url),'utf8');
+ assert.match(drill,/postgres:16-alpine/);assert.match(drill,/Digest mismatch/);assert.doesNotMatch(drill,/aegisgrc-security_aegis-db/);
+ const vm=await rf(new URL('../deploy/worker/create-worker-vm.sh',import.meta.url),'utf8');assert.match(vm,/--no-address/);assert.match(vm,/--shielded-secure-boot/);
+});

@@ -1,0 +1,41 @@
+# AegisGRC scanner worker (Google Cloud VM or any disposable host).
+# Pull-only: no published ports, no database, no persistent volumes. It holds a worker
+# credential and returns signed raw output to the system of record over HTTPS (Cloudflare Tunnel).
+#   docker compose -f docker-compose.worker.yml --env-file .env.worker up -d --build
+services:
+  worker:
+    build: .
+    image: aegisgrc-app:local
+    command: ["npm","run","worker"]
+    restart: unless-stopped
+    env_file: .env.worker
+    environment:
+      NODE_ENV: production
+      ZAP_URL: http://zap:8080
+      # ZAP reaches targets only through this worker's per-task DNS-pinned proxy.
+      ZAP_EGRESS_PROXY_HOST: worker
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/node/.wapiti
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 1g
+    depends_on:
+      - zap
+
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:2.16.1
+    restart: unless-stopped
+    env_file: .env.worker
+    command: ["sh","-c","exec zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.disablekey=false -config api.key=\"$${ZAP_API_KEY}\" -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true"]
+    expose:
+      - "8080"
+    tmpfs:
+      - /home/zap/.ZAP:uid=1000,gid=1000
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1536m

@@ -79,7 +79,59 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # ── Hybrid target architecture (opt-in profiles) ─────────────────────────────────
+  # Zero-trust edge: outbound-only Cloudflare Tunnel. No inbound ports are opened on the host.
+  #   docker compose -f docker-compose.production.yml --profile tunnel up -d caddy-tunnel cloudflared
+  caddy-tunnel:
+    image: caddy:2.10.2-alpine
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    depends_on:
+      - aegis
+    expose:
+      - "80"
+    volumes:
+      - ./deploy/Caddyfile.tunnel:/etc/caddy/Caddyfile:ro
+    read_only: true
+    tmpfs:
+      - /data
+      - /config
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.7
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: ["tunnel","--no-autoupdate","--metrics","0.0.0.0:20241","run"]
+    environment:
+      # Remotely-managed tunnel token from the Cloudflare Zero Trust dashboard.
+      # Export CLOUDFLARE_TUNNEL_TOKEN (or put it in the compose .env) before starting the tunnel profile.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - caddy-tunnel
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # Health monitoring (internal only; publish it through the tunnel on its own Access-protected hostname).
+  uptime-kuma:
+    image: louislam/uptime-kuma:2.5.9
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - uptime-kuma-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
+  uptime-kuma-data:
   zap-data:
   caddy-data:
   caddy-config:

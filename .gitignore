@@ -9,3 +9,5 @@ Caddyfile.backup.*
 docker-compose.yml.backup
 docker-compose.yml.before-db-fix
 .env.before-db-fix
+!.env.worker.example
+*.age
