@@ -230,8 +230,11 @@ test('URL offensive workflow automatically runs full evidence assessment and pre
  assert.doesNotMatch(js,/raw\.textContent='FULL URL ASSESSMENT · '\+status/);
  assert.match(server,/const activeFullScans=new Map<string,Promise<void>>/);
  assert.match(server,/res\.status\(202\)\.json\(\{execution:'REAL_FULL_ASSESSMENT',status:'RUNNING'/);
- assert.match(server,/--top-ports','1000'/);
- assert.match(server,/tool==='nuclei'\?\['-u',safeTarget\.url\.origin,'-jsonl'/);
+ // Scanner argument profiles moved to src/scanner-args.ts (DNS-pinned: nmap by IP, HTTP scanners via the egress proxy).
+ const scannerArgsSrc=await readFile(new URL('../src/scanner-args.ts',import.meta.url),'utf8');
+ assert.match(scannerArgsSrc,/--top-ports','1000'/);
+ assert.match(scannerArgsSrc,/tool==='nuclei'\)return \['-u',url\.origin,'-jsonl'/);
+ assert.match(server,/run\(tool,scannerArgs\(tool,safeTarget\.url,\{proxyUrl:p\.proxyUrl\}\)\)/);
  assert.match(server,/tool==='sqlmap'\?sqlmapTextFindings/);
  const css=await readFile(new URL('../public/enhancements.css',import.meta.url),'utf8');
  assert.match(css,/Enterprise density \+ account placement v6/);

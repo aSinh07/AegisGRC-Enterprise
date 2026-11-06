@@ -39,7 +39,7 @@ import multer from 'multer';
 import { frameworkCatalog,mapFinding } from './grc.js';
 import { assessFramework } from './grc-engine.js';
 import { analyzeDocumentText } from './document-ai.js';
-import { zapReady,zapScan,zapFindings } from './zap.js';
+import { zapReady,zapScanPinned,zapFindings } from './zap.js';
 import { askCopilot } from './copilot.js';
 import { knowledgeCatalog } from './knowledge.js';
 import { extractDocument } from './document-extract.js';
@@ -87,6 +87,8 @@ import {initSecurityFindingProposals,listSecurityFindingProposals,governSecurity
 import {initBreachAssessment,deriveBreachAssessment,listBreachAssessments} from './breach-assessment.js';
 import {recoverInterruptedAssessments,maxFullAssessmentMs} from './assessment-recovery.js';
 import {evidenceSigningKey,verifyEvidenceSignature} from './evidence-signing.js';
+import {pinnedAddress,withPinnedEgress,pinnedHttpGet} from './pinned-egress.js';
+import {scannerArgs,nucleiTemplatesPin} from './scanner-args.js';
 import {verifyAuditChain,checkpointAuditChain,startAuditCheckpointer} from './audit-chain.js';
 import {initScannerJobs,enqueueScannerJob,listScannerJobs,claimScannerJob,recoverStaleScannerJobs,executeClaimedScannerJob,scannerRegistry} from './scanner-jobs.js';
 import { analyzeIntel } from './intel-ai.js';
@@ -581,11 +583,10 @@ const revalidateTarget=revalidatePublicHttpTarget;
 async function quickPosture(assessmentId:string,t:{url:URL,addresses:string[]}){
  t=await revalidateTarget(t);
  const started=Date.now(),createdAt=new Date().toISOString();
- const ctl=new AbortController();const timer=setTimeout(()=>ctl.abort(),1200);
  let status=0,headers:any={},error='';
- try{const r=await fetch(t.url.origin,{method:'GET',redirect:'manual',signal:ctl.signal,headers:{'User-Agent':'AegisGRC-Posture/1.0'}});status=r.status;headers=Object.fromEntries(r.headers.entries());try{await r.body?.cancel()}catch{}}
+ // Pinned to the validated address: the probe never re-resolves the hostname (DNS-rebinding defence).
+ try{const r=await pinnedHttpGet(t,1200,{'User-Agent':'AegisGRC-Posture/1.0'});status=r.status;headers=Object.fromEntries(Object.entries(r.headers).map(([k,v])=>[k,Array.isArray(v)?v.join(', '):String(v??'')]))}
  catch(e:any){error=e?.name==='AbortError'?'HTTP posture probe exceeded 1.2s':String(e?.message||e)}
- finally{clearTimeout(timer)}
  const checks=[
   {bad:t.url.protocol!=='https:',title:'Transport is not HTTPS',severity:'HIGH',cvss:7.4,desc:'The authorized target uses plaintext HTTP.',rem:'Enforce HTTPS and redirect HTTP to HTTPS.'},
   {bad:!headers['strict-transport-security']&&t.url.protocol==='https:',title:'HSTS header not observed',severity:'MEDIUM',cvss:5.3,desc:'Strict-Transport-Security was not observed in the live HTTP response.',rem:'Enable HSTS after validating HTTPS coverage.'},
@@ -706,10 +707,12 @@ app.post('/api/documents/security-scan',upload.single('file'),async(req,res)=>{t
 async function executeRealTool(tool:'nmap'|'wapiti'|'sqlmap'|'zap'|'nuclei',assessmentId:string,t:{url:URL,addresses:string[]},actor:string='system:scanner'){
  t=await revalidateTarget(t);
  const startedAt=new Date().toISOString();let result:{stdout:string;stderr:string;exitCode:number|null;durationMs:number;timedOut:boolean;stdoutTruncated:boolean;stderrTruncated:boolean};let zapAlerts:any[]=[];
- if(tool==='zap'){const z0=Date.now();zapAlerts=await zapScan(t.url.origin);result={stdout:JSON.stringify(zapAlerts),stderr:'',exitCode:0,durationMs:Date.now()-z0,timedOut:false,stdoutTruncated:false,stderrTruncated:false}}
- else {const args=tool==='nmap'?['-sT','-sV','--version-light','-Pn','--top-ports','1000','--open','-oX','-',t.url.hostname]:tool==='wapiti'?['-u',t.url.origin,'--scope','url','--max-scan-time','60','--flush-session']:tool==='nuclei'?['-u',t.url.origin,'-jsonl','-silent','-severity','info,low,medium,high,critical','-timeout','10','-retries','1']:['-u',t.url.toString(),'--batch','--level=1','--risk=1','--threads=1','--timeout=10','--retries=1','--output-dir=/tmp/sqlmap'];result=await run(tool,args)}
+ let egress:Record<string,unknown>;
+ if(tool==='zap'){const z0=Date.now();const out=await zapScanPinned(t);zapAlerts=out.result;egress={mode:'PINNED_FORWARD_PROXY',...out.egress};result={stdout:JSON.stringify(zapAlerts),stderr:'',exitCode:0,durationMs:Date.now()-z0,timedOut:false,stdoutTruncated:false,stderrTruncated:false}}
+ else if(tool==='nmap'){const ip=pinnedAddress(t.addresses);result=await run('nmap',scannerArgs('nmap',t.url,{pinnedAddress:ip}));egress={mode:'DIRECT_PINNED_IP',pinnedAddress:ip,hostname:t.url.hostname}}
+ else {const out=await withPinnedEgress(t,p=>run(tool,scannerArgs(tool,t.url,{proxyUrl:p.proxyUrl})));result=out.result;egress={mode:'PINNED_FORWARD_PROXY',...out.egress}}
  const completedAt=new Date().toISOString(),evidence=JSON.stringify({tool,target:t.url.origin,startedAt,completedAt,...result}),sha256=crypto.createHash('sha256').update(evidence).digest('hex');
- const ev:Evidence={id:crypto.randomUUID(),assessmentId,source:tool,sha256,createdAt:completedAt,exitCode:result.exitCode,stdout:result.stdout,stderr:result.stderr,metadata:{target:t.url.origin,resolvedAddresses:t.addresses,durationMs:result.durationMs,timedOut:result.timedOut,stdoutTruncated:result.stdoutTruncated,stderrTruncated:result.stderrTruncated,attackSurfaceAssessed:tool==='nmap'||tool==='nuclei',attackSurfaceAssetId:t.url.origin}};
+ const ev:Evidence={id:crypto.randomUUID(),assessmentId,source:tool,sha256,createdAt:completedAt,exitCode:result.exitCode,stdout:result.stdout,stderr:result.stderr,metadata:{target:t.url.origin,resolvedAddresses:t.addresses,egress,...(tool==='nuclei'?{nucleiTemplates:nucleiTemplatesPin()}:{}),durationMs:result.durationMs,timedOut:result.timedOut,stdoutTruncated:result.stdoutTruncated,stderrTruncated:result.stderrTruncated,attackSurfaceAssessed:tool==='nmap'||tool==='nuclei',attackSurfaceAssetId:t.url.origin}};
  await db.saveEvidence(ev);
  const findings=tool==='wapiti'?wapitiFindings(assessmentId,t.url.origin,sha256,result.stdout):tool==='nmap'?nmapFindings(assessmentId,t.url.origin,sha256,result.stdout):tool==='nuclei'?nucleiJsonlFindings(assessmentId,t.url.origin,sha256,result.stdout):tool==='sqlmap'?sqlmapTextFindings(assessmentId,t.url.origin,sha256,result.stdout):tool==='zap'?zapFindings(assessmentId,t.url.origin,sha256,zapAlerts):[];
  if(findings.length)await db.saveFindings(findings);
@@ -805,12 +808,14 @@ app.post('/api/scans/run',async(req,res)=>{
     const safeTarget=await revalidateTarget(t);
     const startedAt=new Date().toISOString();
     let result:{stdout:string;stderr:string;exitCode:number|null;durationMs:number}; let zapAlerts:any[]=[];
-    if(tool==='zap'){const z0=Date.now();zapAlerts=await zapScan(safeTarget.url.origin);result={stdout:JSON.stringify(zapAlerts),stderr:'',exitCode:0,durationMs:Date.now()-z0}}
-    else {const args=tool==='nmap'?['-sT','-sV','--version-light','-Pn','--top-ports','1000','--open','-oX','-',safeTarget.url.hostname]:tool==='wapiti'?['-u',safeTarget.url.origin,'--scope','url','--max-scan-time','60','--flush-session']:tool==='nuclei'?['-u',safeTarget.url.origin,'-jsonl','-silent','-severity','info,low,medium,high,critical','-timeout','10','-retries','1']:['-u',safeTarget.url.toString(),'--batch','--level=1','--risk=1','--threads=1','--timeout=10','--retries=1','--output-dir=/tmp/sqlmap'];result=await run(tool,args)}
+    let egress:Record<string,unknown>;
+    if(tool==='zap'){const z0=Date.now();const out=await zapScanPinned(safeTarget);zapAlerts=out.result;egress={mode:'PINNED_FORWARD_PROXY',...out.egress};result={stdout:JSON.stringify(zapAlerts),stderr:'',exitCode:0,durationMs:Date.now()-z0}}
+    else if(tool==='nmap'){const ip=pinnedAddress(safeTarget.addresses);result=await run('nmap',scannerArgs('nmap',safeTarget.url,{pinnedAddress:ip}));egress={mode:'DIRECT_PINNED_IP',pinnedAddress:ip,hostname:safeTarget.url.hostname}}
+    else {const out=await withPinnedEgress(safeTarget,p=>run(tool,scannerArgs(tool,safeTarget.url,{proxyUrl:p.proxyUrl})));result=out.result;egress={mode:'PINNED_FORWARD_PROXY',...out.egress}}
     const completedAt=new Date().toISOString();
     const evidence=JSON.stringify({tool,target:safeTarget.url.origin,startedAt,completedAt,...result});
     const sha256=crypto.createHash('sha256').update(evidence).digest('hex');
-    const ev:Evidence={id:crypto.randomUUID(),assessmentId,source:tool,sha256,createdAt:completedAt,exitCode:result.exitCode,stdout:result.stdout,stderr:result.stderr,metadata:{target:safeTarget.url.origin,resolvedAddresses:safeTarget.addresses,durationMs:result.durationMs}};
+    const ev:Evidence={id:crypto.randomUUID(),assessmentId,source:tool,sha256,createdAt:completedAt,exitCode:result.exitCode,stdout:result.stdout,stderr:result.stderr,metadata:{target:safeTarget.url.origin,resolvedAddresses:safeTarget.addresses,egress,...(tool==='nuclei'?{nucleiTemplates:nucleiTemplatesPin()}:{}),durationMs:result.durationMs}};
     await db.saveEvidence(ev);
     const findings=tool==='wapiti'?wapitiFindings(assessmentId,safeTarget.url.origin,sha256,result.stdout):tool==='nmap'?nmapFindings(assessmentId,safeTarget.url.origin,sha256,result.stdout):tool==='nuclei'?nucleiJsonlFindings(assessmentId,safeTarget.url.origin,sha256,result.stdout):tool==='sqlmap'?sqlmapTextFindings(assessmentId,safeTarget.url.origin,sha256,result.stdout):tool==='zap'?zapFindings(assessmentId,safeTarget.url.origin,sha256,zapAlerts):[];
     await db.saveAudit({id:crypto.randomUUID(),assessmentId,action:'REAL_SCAN_COMPLETED',actor:u.userId,createdAt:completedAt,metadata:{tool,exitCode:result.exitCode,evidenceHash:sha256,durationMs:result.durationMs}});

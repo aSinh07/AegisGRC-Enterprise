@@ -4,6 +4,7 @@ import pg from 'pg';
 import {requireAssessmentAccess,requireOrgPermission} from './grc-organizations.js';
 import {scanTls,scanHostHardening,scanImageWithGrype,generateSbom,scanKubernetes,scanIac,scanSecrets} from './external-scanners.js';
 import {validatePublicHttpTarget,revalidatePublicHttpTarget} from './network-target.js';
+import {pinnedAddress} from './pinned-egress.js';
 
 export type ScannerEngine='TESTSSL'|'LYNIS'|'GRYPE'|'SYFT'|'KUBESCAPE'|'CHECKOV'|'GITLEAKS';
 export type ScannerJobState='QUEUED'|'RUNNING'|'SUCCEEDED'|'FAILED'|'TIMEOUT'|'TRUNCATED'|'UNAVAILABLE';
@@ -45,7 +46,7 @@ export async function listScannerJobs(userId:string,assessmentId:string){
  return (await pool.query(`SELECT id,engine,target,state,evidence_id,evidence_hash,error,created_at,started_at,completed_at
  FROM scanner_jobs WHERE organization_id=$1 AND assessment_id=$2 ORDER BY created_at DESC LIMIT 200`,[access.organization_id,assessmentId])).rows
 }
-async function execute(e:ScannerEngine,target:string){switch(e){case'TESTSSL':{const checked=await validatePublicHttpTarget(target);const fresh=await revalidatePublicHttpTarget(checked);return scanTls(fresh.url.origin)}case'LYNIS':return scanHostHardening(target);case'GRYPE':return scanImageWithGrype(target);case'SYFT':return generateSbom(target);case'KUBESCAPE':return scanKubernetes(target);case'CHECKOV':return scanIac(target);case'GITLEAKS':return scanSecrets(target)}}
+async function execute(e:ScannerEngine,target:string){switch(e){case'TESTSSL':{const checked=await validatePublicHttpTarget(target);const fresh=await revalidatePublicHttpTarget(checked);return scanTls(fresh.url.origin,pinnedAddress(fresh.addresses))}case'LYNIS':return scanHostHardening(target);case'GRYPE':return scanImageWithGrype(target);case'SYFT':return generateSbom(target);case'KUBESCAPE':return scanKubernetes(target);case'CHECKOV':return scanIac(target);case'GITLEAKS':return scanSecrets(target)}}
 export async function recoverStaleScannerJobs(){const lease=Math.max(60,Number(process.env.SCANNER_JOB_LEASE_SECONDS||900)),maxAttempts=Math.max(1,Number(process.env.SCANNER_JOB_MAX_ATTEMPTS||2));return (await pool.query(`UPDATE scanner_jobs SET state=CASE WHEN attempts >= $2 THEN 'FAILED' ELSE 'QUEUED' END,error=CASE WHEN attempts >= $2 THEN 'Scanner worker lease expired after maximum attempts' ELSE error END,started_at=NULL,completed_at=CASE WHEN attempts >= $2 THEN now() ELSE NULL END WHERE state='RUNNING' AND started_at < now()-($1::text||' seconds')::interval RETURNING id,state`,[lease,maxAttempts])).rows}
 export async function claimScannerJob(){
  const c=await pool.connect();try{await c.query('BEGIN');const row=(await c.query(`SELECT * FROM scanner_jobs WHERE state='QUEUED' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1`)).rows[0];

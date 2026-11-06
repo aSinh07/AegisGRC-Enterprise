@@ -83,3 +83,72 @@ test('evidence saved through the store verifies after a real PostgreSQL jsonb ro
   const tampered=structuredClone(row.payload);tampered.stdout='clean';assert.equal(verifyEvidenceSignature(tampered,env).status,'INVALID');
  }finally{await pool.end()}
 });
+
+// ── Gap: scanners re-resolve DNS after scope validation (DNS rebinding) ─────
+import http from 'node:http';
+import net from 'node:net';
+import {startProxyPinnedTo,pinnedAddress,pinnedLookup} from '../src/pinned-egress.js';
+import {scannerArgs} from '../src/scanner-args.js';
+
+test('pinned egress proxy connects only to the validated address, never re-resolving the hostname',async()=>{
+ const seen:string[]=[];
+ const origin=http.createServer((req,res)=>{seen.push(String(req.headers.host));res.end('pinned-ok')});
+ await new Promise<void>(r=>origin.listen(0,'127.0.0.1',()=>r()));
+ const port=(origin.address() as net.AddressInfo).port;
+ // "rebind.example" does not resolve at all: success proves the proxy used the pinned IP, not DNS.
+ const proxy=await startProxyPinnedTo('127.0.0.1','rebind.example',[port]);
+ const viaProxy=(target:string)=>new Promise<{status:number;body:string}>((resolve,reject)=>{
+  const req=http.request({host:'127.0.0.1',port:proxy.port,path:target,method:'GET'},res=>{let b='';res.on('data',d=>b+=d);res.on('end',()=>resolve({status:res.statusCode||0,body:b}))});req.on('error',reject);req.end()});
+ try{
+  const ok=await viaProxy(`http://rebind.example:${port}/`);
+  assert.equal(ok.status,200);assert.equal(ok.body,'pinned-ok');assert.equal(seen[0],`rebind.example:${port}`);
+  assert.equal((await viaProxy(`http://169.254.169.254:${port}/latest/meta-data/`)).status,403,'other hosts are refused');
+  assert.equal((await viaProxy('http://rebind.example:6379/')).status,403,'other ports are refused');
+  const connect=await new Promise<string>(resolve=>{const s=net.connect(proxy.port,'127.0.0.1',()=>s.write('CONNECT internal.example:443 HTTP/1.1\r\nHost: internal.example:443\r\n\r\n'));s.once('data',d=>{resolve(String(d));s.destroy()})});
+  assert.match(connect,/403/);
+  assert.equal(proxy.record.allowed,1);assert.equal(proxy.record.denied.length,3);
+ }finally{await proxy.close();origin.close()}
+});
+test('pinned address selection refuses private and reserved addresses',()=>{
+ assert.throws(()=>pinnedAddress(['127.0.0.1','10.0.0.5','169.254.169.254']),/No validated public address/);
+ assert.equal(pinnedAddress(['2606:4700::1','93.184.216.34']),'93.184.216.34');
+ const lookup=pinnedLookup({url:new URL('https://example.com'),addresses:['93.184.216.34']});
+ lookup('example.com',{all:true},(err:any,addrs:any)=>{assert.equal(err,null);assert.deepEqual(addrs,[{address:'93.184.216.34',family:4}])});
+ lookup('evil.example',{},(err:any)=>assert.match(String(err?.message),/outside the authorized target/));
+});
+test('every URL scanner profile is pinned: nmap by IP, HTTP scanners through the loopback proxy',()=>{
+ const u=new URL('https://example.com/');
+ const nmap=scannerArgs('nmap',u,{pinnedAddress:'93.184.216.34'});assert.equal(nmap.at(-1),'93.184.216.34');assert.ok(!nmap.includes('example.com'));
+ assert.ok(scannerArgs('nmap',u,{pinnedAddress:'2606:4700::1'}).includes('-6'));
+ assert.ok(scannerArgs('wapiti',u,{proxyUrl:'http://127.0.0.1:4000'}).includes('--proxy'));
+ assert.ok(scannerArgs('sqlmap',u,{proxyUrl:'http://127.0.0.1:4000'}).includes('--proxy=http://127.0.0.1:4000'));
+ const nuclei=scannerArgs('nuclei',u,{proxyUrl:'http://127.0.0.1:4000'});assert.ok(nuclei.includes('-proxy'));assert.deepEqual(nuclei.slice(nuclei.indexOf('-pt'),nuclei.indexOf('-pt')+2),['-pt','http']);
+ for(const tool of ['wapiti','nuclei','sqlmap'] as const)assert.throws(()=>scannerArgs(tool,u,{}),/pinned loopback egress proxy/);
+ assert.throws(()=>scannerArgs('nmap',u,{}),/pinned IP/);
+});
+test('server scanner paths use pinned egress and ZAP fails closed without a pinned upstream',async()=>{
+ const server=await readFile(new URL('../src/server.ts',import.meta.url),'utf8');
+ assert.doesNotMatch(server,/'--open','-oX','-',(t|safeTarget)\.url\.hostname/);
+ assert.doesNotMatch(server,/zapScan\(/);assert.equal((server.match(/zapScanPinned\(/g)||[]).length,2);
+ assert.doesNotMatch(server,/await fetch\(t\.url\.origin/);
+ const {zapScanPinned}=await import('../src/zap.js');const prior=process.env.ZAP_EGRESS_PROXY_HOST;delete process.env.ZAP_EGRESS_PROXY_HOST;
+ try{await assert.rejects(zapScanPinned({url:new URL('https://example.com'),addresses:['93.184.216.34']}),/fail closed/)}finally{if(prior!==undefined)process.env.ZAP_EGRESS_PROXY_HOST=prior}
+ const jobs=await readFile(new URL('../src/scanner-jobs.ts',import.meta.url),'utf8');assert.match(jobs,/scanTls\(fresh\.url\.origin,pinnedAddress\(fresh\.addresses\)\)/);
+});
+
+// ── Gap: Nuclei templates are not pinned in the image ───────────────────────
+import {nucleiTemplatesPin} from '../src/scanner-args.js';
+import {mkdtemp,writeFile} from 'node:fs/promises';
+import os from 'node:os';
+test('nuclei templates are pinned by release and commit, read-only, and never auto-updated',async()=>{
+ const docker=await readFile(new URL('../Dockerfile',import.meta.url),'utf8');
+ assert.match(docker,/NUCLEI_TEMPLATES_VERSION=v\d+\.\d+\.\d+/);
+ assert.match(docker,/NUCLEI_TEMPLATES_COMMIT=[0-9a-f]{40}/);
+ assert.match(docker,/test "\$\(git -C \/opt\/nuclei-templates rev-parse HEAD\)" = "\$\{NUCLEI_TEMPLATES_COMMIT\}"/);
+ assert.match(docker,/chmod -R a-w \/opt\/nuclei-templates/);
+ const args=scannerArgs('nuclei',new URL('https://example.com'),{proxyUrl:'http://127.0.0.1:1'});
+ assert.ok(args.includes('-duc'));assert.equal(args[args.indexOf('-t')+1],'/opt/nuclei-templates');assert.ok(args.includes('-ni'));
+ const dir=await mkdtemp(os.tmpdir()+'/nt-');assert.equal(nucleiTemplatesPin(dir).version,'UNPINNED');
+ await writeFile(dir+'/.aegis-pin','v10.5.1 79fb682760ab3d5b0e22afbb44709353cbebf023\n');
+ assert.deepEqual(nucleiTemplatesPin(dir),{version:'v10.5.1',commit:'79fb682760ab3d5b0e22afbb44709353cbebf023'});
+});

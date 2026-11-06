@@ -19,6 +19,8 @@ services:
     env_file: .env.production
     environment:
       ZAP_URL: http://zap:8080
+      # ZAP reaches the target only through the app's per-scan DNS-pinned egress proxy.
+      ZAP_EGRESS_PROXY_HOST: aegis
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,5 +1,6 @@
 import {spawn} from 'node:child_process';
 import crypto from 'node:crypto';
+import net from 'node:net';
 
 export type ExternalTool='testssl'|'lynis'|'grype'|'syft'|'kubescape'|'checkov'|'gitleaks';
 const MAX=Number(process.env.EXTERNAL_SCANNER_MAX_BYTES||8*1024*1024);
@@ -18,7 +19,8 @@ export async function run(command:string,args:string[],meta:Record<string,unknow
  p.on('close',(code)=>{if(settled)return;settled=true;clearTimeout(timer);const state=timedOut?'TIMEOUT':truncated?'TRUNCATED':code===0?'SUCCESS':'FAILED';const raw=JSON.stringify({command,args,meta,stdout:out,stderr:err,exitCode:code,timedOut,truncated});resolve({execution:'REAL_TOOL_EXECUTION',tool:String(meta.tool||command),command,args,exitCode:code,stdout:out,stderr:err,timedOut,truncated,state,durationMs:Date.now()-started,evidence:{sha256:crypto.createHash('sha256').update(raw).digest('hex')},metadata:meta})});
  });
 }
-export const scanTls=(target:string)=>run('testssl.sh',['--jsonfile-pretty','/dev/stdout','--warnings','off',safe(target,'TLS target')],{tool:'testssl',target});
+// --ip pins testssl to the validated address so it never re-resolves the hostname (DNS rebinding).
+export const scanTls=(target:string,pinnedIp:string)=>{if(!net.isIP(pinnedIp))throw new Error('testssl requires the validated pinned IP address');return run('testssl.sh',['--jsonfile-pretty','/dev/stdout','--warnings','off','--ip',pinnedIp,safe(target,'TLS target')],{tool:'testssl',target,pinnedAddress:pinnedIp})};
 export const scanHostHardening=(targetPath:string)=>run('lynis',['audit','system','--quick','--no-colors'],{tool:'lynis',target:workspace(targetPath)});
 export const scanImageWithGrype=(imageRef:string)=>run('grype',[image(imageRef),'-o','json'],{tool:'grype',imageRef});
 export const generateSbom=(target:string)=>run('syft',[target.startsWith('/workspace/')?workspace(target):image(target),'-o','cyclonedx-json'],{tool:'syft',target});
