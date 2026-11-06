@@ -221,3 +221,28 @@ CREATE TABLE IF NOT EXISTS target_authorizations(
  CONSTRAINT target_authorizations_approval_complete CHECK(status<>'APPROVED' OR (decided_by IS NOT NULL AND verified_at IS NOT NULL AND expires_at IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS target_authorizations_lookup_idx ON target_authorizations(organization_id,hostname,status,expires_at);
+
+-- Issued reports: exact bytes, SHA-256 and an HMAC (REPORT_SIGNING_KEY) over the record.
+CREATE TABLE IF NOT EXISTS report_records(
+ id uuid PRIMARY KEY,
+ organization_id uuid REFERENCES grc_organizations(id) ON DELETE RESTRICT,
+ assessment_id uuid REFERENCES assessments(id) ON DELETE RESTRICT,
+ scope_ref text,
+ report_type text NOT NULL,
+ format text NOT NULL,
+ filename text NOT NULL,
+ content_type text NOT NULL,
+ sha256 text NOT NULL CHECK(sha256 ~ '^[0-9a-f]{64}$'),
+ size_bytes bigint NOT NULL,
+ content bytea NOT NULL,
+ hmac_sha256 text,
+ key_id text,
+ generated_by uuid,
+ generated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS report_records_sha_type_idx ON report_records(sha256,report_type);
+CREATE INDEX IF NOT EXISTS report_records_org_idx ON report_records(organization_id,generated_at DESC);
+DROP TRIGGER IF EXISTS report_records_append_only ON report_records;
+CREATE TRIGGER report_records_append_only BEFORE UPDATE OR DELETE ON report_records FOR EACH ROW EXECUTE FUNCTION aegis_forbid_evidence_mutation();
+DROP TRIGGER IF EXISTS report_records_no_truncate ON report_records;
+CREATE TRIGGER report_records_no_truncate BEFORE TRUNCATE ON report_records FOR EACH STATEMENT EXECUTE FUNCTION aegis_forbid_evidence_mutation();

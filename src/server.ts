@@ -91,6 +91,7 @@ import {evidenceSigningKey,verifyEvidenceSignature} from './evidence-signing.js'
 import {pinnedAddress,withPinnedEgress,pinnedHttpGet} from './pinned-egress.js';
 import {scannerArgs,nucleiTemplatesPin} from './scanner-args.js';
 import {pool as dbPool} from './db-pool.js';
+import {recordSignedReport,reportHeaders,verifyReportRecord,verifyReportBytes} from './report-records.js';
 import {requestTargetAuthorization,verifyTargetAuthorization,decideTargetAuthorization,revokeTargetAuthorization,listTargetAuthorizations,targetAuthorizationBasis,assertTargetAuthorized} from './target-authorization.js';
 import {verifyAuditChain,checkpointAuditChain,startAuditCheckpointer} from './audit-chain.js';
 import {initScannerJobs,enqueueScannerJob,listScannerJobs,claimScannerJob,recoverStaleScannerJobs,executeClaimedScannerJob,scannerRegistry} from './scanner-jobs.js';
@@ -384,6 +385,7 @@ app.get('/api/grc/assessments/:assessmentId/audit-package.:format',async(req,res
  else if(format==='xlsx'){body=auditXlsx(model);contentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';ext='xlsx'}
  else if(format==='pdf'){body=await auditPdf(model);contentType='application/pdf';ext='pdf'}
  else return res.status(400).json({error:'Audit package format must be pdf, docx or xlsx'});
+ if(ext==='pdf'){const acc=await requireAssessmentAccess(u.userId,req.params.assessmentId);await issueSignedPdf(res,{organizationId:acc.organization_id,assessmentId:req.params.assessmentId,reportType:'AUDIT_PACKAGE',format:'pdf',filename:'AegisGRC-Audit-'+req.params.assessmentId+'.pdf',contentType,body,actor:u.userId})}
  res.setHeader('Content-Type',contentType);res.setHeader('Content-Disposition','attachment; filename="AegisGRC-Audit-'+req.params.assessmentId+'.'+ext+'"');res.send(body);
  }catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.get('/api/grc/assessments/:assessmentId/traceability',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await assessmentTrace(u.userId,req.params.assessmentId))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
@@ -419,6 +421,7 @@ app.get('/api/grc/organizations/:orgId/scopes/:scopeId/audit-readiness.:format',
  else if(format==='docx'){body=await readinessDocx(model);contentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document';ext='docx'}
  else if(format==='xlsx'){body=readinessXlsx(model);contentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';ext='xlsx'}
  else return res.status(400).json({error:'Audit readiness format must be pdf, docx or xlsx'});
+ if(ext==='pdf')await issueSignedPdf(res,{organizationId:req.params.orgId,scopeRef:req.params.scopeId,reportType:'AUDIT_READINESS',format:'pdf',filename:'AegisGRC-Readiness-'+req.params.scopeId+'.pdf',contentType,body,actor:u.userId});
  res.setHeader('Content-Type',contentType);res.setHeader('Content-Disposition','attachment; filename="AegisGRC-Readiness-'+req.params.scopeId+'.'+ext+'"');res.send(body);
  }catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 
@@ -520,6 +523,7 @@ app.get('/api/grc/organizations/:orgId/scopes/:scopeId/enterprise-report.:format
  else if(format==='xlsx'){body=enterpriseGrcXlsx(model);contentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}
  else if(format==='json'){body=Buffer.from(JSON.stringify(model,null,2))}
  else return res.status(400).json({error:'Enterprise GRC report format must be pdf, docx, xlsx or json'});
+ if(format==='pdf')await issueSignedPdf(res,{organizationId:req.params.orgId,scopeRef:req.params.scopeId,reportType:combined?'COMBINED_ASSURANCE':'ENTERPRISE_GRC',format:'pdf',filename:(combined?'AegisGRC-Combined-Assurance-':'AegisGRC-Enterprise-')+req.params.scopeId+'.pdf',contentType,body,actor:u.userId});
  res.setHeader('Content-Type',contentType);res.setHeader('Content-Disposition','attachment; filename="'+(combined?'AegisGRC-Combined-Assurance-':'AegisGRC-Enterprise-')+req.params.scopeId+'.'+ext+'"');res.send(body);
  }catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 
@@ -649,6 +653,10 @@ app.post('/api/grc/organizations/:orgId/target-authorizations',async(req,res)=>{
 app.post('/api/grc/organizations/:orgId/target-authorizations/:id/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const out=await verifyTargetAuthorization(u.userId,req.params.orgId,req.params.id);res.status(out.verified?200:409).json(out)}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.post('/api/grc/organizations/:orgId/target-authorizations/:id/decision',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await decideTargetAuthorization(u.userId,req.params.orgId,req.params.id,req.body||{}))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.post('/api/grc/organizations/:orgId/target-authorizations/:id/revoke',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await revokeTargetAuthorization(u.userId,req.params.orgId,req.params.id,String(req.body?.reason||'')))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+// Every governed PDF is persisted as a signed report record before it is returned.
+async function issueSignedPdf(res:any,input:Parameters<typeof recordSignedReport>[0]){if(db.mode()!=='postgres')return null;const rec=await recordSignedReport(input);for(const [k,v] of Object.entries(reportHeaders(rec)))res.setHeader(k,v);return rec}
+app.get('/api/reports/:id/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const out=await verifyReportRecord(u.userId,req.params.id);res.status(out.status==='VERIFIED'?200:out.status==='UNKNOWN_REPORT'?404:409).json(out)}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.post('/api/reports/verify',upload.single('report'),async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});if(!req.file)return res.status(400).json({error:'Attach the report file as "report"'});const out=await verifyReportBytes(u.userId,req.file.buffer);res.status(out.status==='VERIFIED'?200:out.status==='UNKNOWN_REPORT'?404:409).json(out)}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.get('/api/admin/audit-chain/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});if(!['grc_reviewer','admin'].includes(String(await userRole(u.userId))))return res.status(403).json({error:'Reviewer or admin role required'});const report=await verifyAuditChain();res.status(report.status==='BROKEN'?409:200).json(report)}catch(e:any){res.status(503).json({error:'Audit chain verification unavailable',detail:String(e?.message||e)})}});
 app.post('/api/admin/audit-chain/checkpoint',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});if(String(await userRole(u.userId))!=='admin')return res.status(403).json({error:'Admin role required'});res.json(await checkpointAuditChain())}catch(e:any){res.status(503).json({error:String(e?.message||e)})}});
 app.get('/api/assessments/:id/evidence/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const a=await db.assessmentForUser(u.userId,req.params.id);if(!a)return res.status(404).json({error:'Assessment not found'});const rows=await db.evidenceForAssessment(a.id);const results=rows.map(x=>({id:x.id,source:x.source,sha256:x.sha256,createdAt:x.createdAt,...verifyEvidenceSignature(x)}));const counts=results.reduce((m:any,x)=>{m[x.status]=(m[x.status]||0)+1;return m},{});res.status(results.some(x=>x.status==='INVALID')?409:200).json({assessmentId:a.id,total:results.length,counts,results})}catch(e:any){res.status(500).json({error:String(e?.message||e)})}});
@@ -890,8 +898,9 @@ app.post('/api/assessments/:id/generated-security-report/:source',async(req,res)
  const reportId=[hex.slice(0,8).join(''),hex.slice(8,12).join(''),hex.slice(12,16).join(''),hex.slice(16,20).join(''),hex.slice(20,32).join('')].join('-');
  const existing=await db.document(reportId),createdAt=existing?.createdAt||new Date().toISOString(),filename=`aegis-${kind}-${a.id}.pdf`;
  if(!existing){await db.saveDocument({id:reportId,assessmentId:a.id,filename,mimeType:'application/pdf',size:body.length,sha256,createdAt,content:body});await db.saveAudit({id:crypto.randomUUID(),assessmentId:a.id,action:'GENERATED_SECURITY_REPORT_RECORDED',actor:u.userId,createdAt,metadata:{documentId:reportId,filename,size:body.length,sha256,documentType:source==='OFFENSIVE'?'PENTEST_REPORT':'COMPLIANCE_EVIDENCE',generated:true,securitySource:source,target:a.target}})}
+ const signedRecord=await issueSignedPdf(res,{organizationId:access.organization_id,assessmentId:a.id,reportType:source as 'OFFENSIVE'|'DEFENSIVE',format:'pdf',filename,contentType:'application/pdf',body,actor:u.userId});
  const handoff=await createSecurityReportHandoff(u.userId,access.organization_id,{assessmentId:a.id,reportId,source:source as 'OFFENSIVE'|'DEFENSIVE',sha256,recordedAt:createdAt,evidenceRefs:[reportId],frameworksRequested:[],sourceContext:{generatedBy:'AEGIS',inputMode:'AUTHORIZED_URL_ASSESSMENT',target:a.target,reportKind:kind}});
- res.status(existing?200:201).json({generated:true,reused:Boolean(existing),source,organizationId:access.organization_id,assessmentId:a.id,target:a.target,report:{id:reportId,filename,sha256,size:body.length},grcHandoff:{id:handoff.id,status:handoff.status,source:handoff.source,sourceContext:handoff.source_context||{}}});
+ res.status(existing?200:201).json({generated:true,reused:Boolean(existing),source,organizationId:access.organization_id,assessmentId:a.id,target:a.target,report:{id:reportId,filename,sha256,size:body.length},signedRecord:signedRecord?{id:signedRecord.id,signature:signedRecord.signature,verify:'/api/reports/'+signedRecord.id+'/verify'}:null,grcHandoff:{id:handoff.id,status:handoff.status,source:handoff.source,sourceContext:handoff.source_context||{}}});
 }catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 
 app.get('/api/security/offensive/catalog',(_req,res)=>res.json({domains:offensiveCapabilityCatalog(),truthBoundary:'Coverage describes supported assessment domains and evidence engines. Actual coverage is established only by successful execution or imported evidence for the declared scope.'}));
@@ -994,6 +1003,7 @@ app.get('/api/assessments/:id/report.pdf',async(req,res)=>{
  const step=await reportAuthorized(req);if(!step.ok)return res.status(401).json({code:step.reason,error:'Password and authenticator verification required for report download'});
  const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const a=await db.assessmentForUser(u.userId,req.params.id);if(!a)return res.status(404).json({error:'Not found'});
  const fs=await db.findingsForAssessment(req.params.id);const ev=await db.evidenceForAssessment(req.params.id);const pdf=await renderPdf(a,fs,ev);
+ await issueSignedPdf(res,{organizationId:await assessmentOrganizationId(a.id),assessmentId:a.id,reportType:'ASSESSMENT_REPORT',format:'pdf',filename:`aegis-${a.id}.pdf`,contentType:'application/pdf',body:pdf,actor:u.userId});
  res.setHeader('Content-Disposition',`attachment; filename="aegis-${a.id}.pdf"`);res.type('application/pdf').send(pdf);
 });
 app.get('/api/assessments/:id/report/download',async(req,res)=>{
@@ -1038,6 +1048,7 @@ app.get('/api/assessments/:id/export/:kind/:format',async(req,res)=>{
    const access=await requireAssessmentAccess(u.userId,a.id);
    await createSecurityReportHandoff(u.userId,access.organization_id,{assessmentId:a.id,reportId,source,sha256,recordedAt:existing?.createdAt||new Date().toISOString(),evidenceRefs:[reportId],frameworksRequested:[]});
   }
+  if(format==='pdf')await issueSignedPdf(res,{organizationId:await assessmentOrganizationId(a.id),assessmentId:a.id,reportType:kind==='technical'?'OFFENSIVE':kind==='remediation'?'DEFENSIVE':'ASSESSMENT_REPORT',format:'pdf',filename:`aegis-${kind}-${a.id}.pdf`,contentType:'application/pdf',body,actor:u.userId});
   res.setHeader('Content-Disposition',`attachment; filename="aegis-${kind}-${a.id}.${format}"`);res.type(mime).send(body);
  }catch(e:any){res.status(500).json({error:e.message})}
 });

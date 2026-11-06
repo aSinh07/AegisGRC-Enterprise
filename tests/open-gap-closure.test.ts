@@ -321,3 +321,48 @@ test('confirming a finding auto-creates one issue, risk and CAPA under the polic
   const failed=await fp.autoPromoteConfirmedFinding(orgId,aid,critical,analyst);assert.equal(failed.status,'FAILED');assert.match(String(failed.reason),/Insufficient organization role/);
  }finally{await pool.end()}
 });
+
+// ── Gap: Offensive/Defensive/Enterprise PDFs are not persisted or signed ────
+test('every governed PDF endpoint records a signed report before responding',async()=>{
+ const server=await readFile(new URL('../src/server.ts',import.meta.url),'utf8');
+ for(const type of ['AUDIT_PACKAGE','AUDIT_READINESS',"combined?'COMBINED_ASSURANCE':'ENTERPRISE_GRC'","reportType:'ASSESSMENT_REPORT'","kind==='technical'?'OFFENSIVE':kind==='remediation'?'DEFENSIVE'","reportType:source as 'OFFENSIVE'|'DEFENSIVE'"])assert.ok(server.includes(type),type);
+ assert.equal((server.match(/await issueSignedPdf\(res,/g)||[]).length,6);
+ assert.match(server,/app\.post\('\/api\/reports\/verify',upload\.single\('report'\)/);
+});
+test('signed report records verify, dedupe, and detect altered bytes or forged signatures',{skip:!ciDb},async()=>{
+ process.env.REPORT_SIGNING_KEY='r'.repeat(48);
+ const rr=await import('../src/report-records.js');
+ const {createOrganization}=await import('../src/grc-organizations.js');
+ const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:false});
+ try{
+  const mk=async()=>{const id=crypto.randomUUID();await pool.query("INSERT INTO app_users(id,email,password_hash,password_salt,totp_secret) VALUES($1,$2,'x','x','x')",[id,id+'@t.example']);return id};
+  const user=await mk(),outsider=await mk();
+  const org:any=await createOrganization(user,{name:'Reports '+user.slice(0,8)});const orgId=org.id||org.organization?.id;
+  const body=Buffer.from('%PDF-1.7 enterprise report '+crypto.randomUUID());
+  const rec=await rr.recordSignedReport({organizationId:orgId,reportType:'ENTERPRISE_GRC',format:'pdf',filename:'e.pdf',contentType:'application/pdf',body,actor:user});
+  assert.equal(rec.reused,false);assert.match(String(rec.signature),/^[0-9a-f]{64}$/);
+  assert.equal((await rr.recordSignedReport({organizationId:orgId,reportType:'ENTERPRISE_GRC',format:'pdf',filename:'e.pdf',contentType:'application/pdf',body,actor:user})).id,rec.id,'identical bytes reuse the record');
+  assert.equal((await rr.verifyReportRecord(user,rec.id)).status,'VERIFIED');
+  assert.equal((await rr.verifyReportBytes(user,body)).status,'VERIFIED');
+  assert.equal((await rr.verifyReportBytes(user,Buffer.concat([body,Buffer.from(' ')]))).status,'UNKNOWN_REPORT','one changed byte is not an issued report');
+  assert.equal((await rr.verifyReportBytes(outsider,body)).status,'UNKNOWN_REPORT','other tenants cannot probe records');
+  await assert.rejects(rr.verifyReportRecord(outsider,rec.id),/membership required/);
+  await assert.rejects(pool.query('UPDATE report_records SET content=$2 WHERE id=$1',[rec.id,Buffer.from('forged')]),/append-only/);
+  const c=await pool.connect();
+  try{await c.query('BEGIN');await c.query("SET LOCAL aegis.allow_evidence_purge='on'");
+   await c.query("UPDATE report_records SET hmac_sha256=repeat('0',64) WHERE id=$1",[rec.id]);
+   const row=(await c.query('SELECT * FROM report_records WHERE id=$1',[rec.id])).rows[0];
+   assert.equal(rr.checkSignature(row),'SIGNATURE_INVALID','a privileged signature overwrite is detected');
+   assert.equal(rr.checkSignature({...row,report_type:'OFFENSIVE',hmac_sha256:rec.signature}),'SIGNATURE_INVALID','re-labelling the report type breaks the signature');
+   await c.query('ROLLBACK')}finally{c.release()}
+  assert.equal((await rr.verifyReportRecord(user,rec.id)).status,'VERIFIED','original record intact after rollback');
+  const prior=process.env.REPORT_SIGNING_KEY;process.env.REPORT_SIGNING_KEY='q'.repeat(48);
+  assert.equal((await rr.verifyReportRecord(user,rec.id)).status,'KEY_MISMATCH');process.env.REPORT_SIGNING_KEY=prior;
+ }finally{await pool.end()}
+});
+test('signed report issuance fails closed in production without a real key',async()=>{
+ const rr=await import('../src/report-records.js');
+ assert.throws(()=>rr.reportRecordKey({NODE_ENV:'production'} as any),/REPORT_SIGNING_KEY/);
+ assert.throws(()=>rr.reportRecordKey({NODE_ENV:'production',REPORT_SIGNING_KEY:'replace-with-at-least-32-random-characters'} as any),/REPORT_SIGNING_KEY/);
+ assert.equal(rr.reportRecordKey({NODE_ENV:'test'} as any),null);
+});
