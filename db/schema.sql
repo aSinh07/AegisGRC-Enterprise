@@ -126,3 +126,73 @@ ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_assessment_id_fkey;
 ALTER TABLE evidence ADD CONSTRAINT evidence_assessment_id_fkey FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE RESTRICT;
 ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_assessment_id_fkey;
 ALTER TABLE documents ADD CONSTRAINT documents_assessment_id_fkey FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE RESTRICT;
+
+-- Keyed evidence integrity. The HMAC (EVIDENCE_HMAC_KEY, held only by the application)
+-- covers the canonical evidence record, so a database-only writer cannot forge evidence.
+ALTER TABLE evidence ADD COLUMN IF NOT EXISTS hmac_sha256 text;
+ALTER TABLE evidence ADD COLUMN IF NOT EXISTS hmac_key_id text;
+
+-- Tamper-evident audit trail: every audit event is hash-chained to its predecessor at
+-- insert time, whichever code path writes it. Chaining runs under a transaction-scoped
+-- advisory lock so concurrent writers produce one linear chain.
+CREATE SEQUENCE IF NOT EXISTS audit_events_chain_seq;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS chain_seq bigint;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS prev_hash text;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS entry_hash text;
+CREATE UNIQUE INDEX IF NOT EXISTS audit_events_chain_seq_idx ON audit_events(chain_seq);
+
+CREATE OR REPLACE FUNCTION aegis_audit_entry_hash(prev text,event_id uuid,assessment uuid,act text,created timestamptz,body jsonb) RETURNS text LANGUAGE sql STABLE AS $$
+ SELECT encode(sha256(convert_to(
+  'aegis-audit-v1|'||prev||'|'||event_id::text||'|'||coalesce(assessment::text,'')||'|'||act||'|'||
+  to_char(created AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')||'|'||body::text,'UTF8')),'hex')
+$$;
+
+CREATE OR REPLACE FUNCTION aegis_chain_audit_event() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE last_hash text;
+BEGIN
+ PERFORM pg_advisory_xact_lock(7314159265);
+ SELECT entry_hash INTO last_hash FROM audit_events WHERE chain_seq IS NOT NULL ORDER BY chain_seq DESC LIMIT 1;
+ NEW.chain_seq := nextval('audit_events_chain_seq');
+ NEW.prev_hash := coalesce(last_hash,repeat('0',64));
+ NEW.entry_hash := aegis_audit_entry_hash(NEW.prev_hash,NEW.id,NEW.assessment_id,NEW.action,NEW.created_at,NEW.payload);
+ RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS audit_events_hash_chain ON audit_events;
+CREATE TRIGGER audit_events_hash_chain BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION aegis_chain_audit_event();
+
+-- Chain rows that predate the hash chain, in creation order (one-time, idempotent).
+DO $$
+DECLARE r record; last_hash text; h text; s bigint;
+BEGIN
+ IF EXISTS (SELECT 1 FROM audit_events WHERE chain_seq IS NULL) THEN
+  PERFORM pg_advisory_xact_lock(7314159265);
+  PERFORM set_config('aegis.allow_evidence_purge','on',true);
+  SELECT entry_hash INTO last_hash FROM audit_events WHERE chain_seq IS NOT NULL ORDER BY chain_seq DESC LIMIT 1;
+  last_hash := coalesce(last_hash,repeat('0',64));
+  FOR r IN SELECT id,assessment_id,action,created_at,payload FROM audit_events WHERE chain_seq IS NULL ORDER BY created_at,id LOOP
+   s := nextval('audit_events_chain_seq');
+   h := aegis_audit_entry_hash(last_hash,r.id,r.assessment_id,r.action,r.created_at,r.payload);
+   UPDATE audit_events SET chain_seq=s,prev_hash=last_hash,entry_hash=h WHERE id=r.id;
+   last_hash := h;
+  END LOOP;
+  PERFORM set_config('aegis.allow_evidence_purge','off',true);
+ END IF;
+END;
+$$;
+
+-- HMAC-signed chain-head checkpoints. Recomputing the whole chain after tampering is
+-- detectable because the checkpoint MAC needs the application-held EVIDENCE_HMAC_KEY.
+CREATE TABLE IF NOT EXISTS audit_chain_checkpoints(
+ id uuid PRIMARY KEY,
+ chain_seq bigint NOT NULL,
+ entry_hash text NOT NULL,
+ hmac_sha256 text NOT NULL,
+ key_id text NOT NULL,
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS audit_chain_checkpoints_seq_idx ON audit_chain_checkpoints(chain_seq DESC);
+DROP TRIGGER IF EXISTS audit_chain_checkpoints_append_only ON audit_chain_checkpoints;
+CREATE TRIGGER audit_chain_checkpoints_append_only BEFORE UPDATE OR DELETE ON audit_chain_checkpoints FOR EACH ROW EXECUTE FUNCTION aegis_forbid_evidence_mutation();
+DROP TRIGGER IF EXISTS audit_chain_checkpoints_no_truncate ON audit_chain_checkpoints;
+CREATE TRIGGER audit_chain_checkpoints_no_truncate BEFORE TRUNCATE ON audit_chain_checkpoints FOR EACH STATEMENT EXECUTE FUNCTION aegis_forbid_evidence_mutation();

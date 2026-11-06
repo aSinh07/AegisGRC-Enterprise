@@ -86,6 +86,8 @@ import {initSecurityReportHandoffs,createSecurityReportHandoff,reviewSecurityRep
 import {initSecurityFindingProposals,listSecurityFindingProposals,governSecurityFindingProposal,rejectSecurityFindingProposal} from './security-report-findings.js';
 import {initBreachAssessment,deriveBreachAssessment,listBreachAssessments} from './breach-assessment.js';
 import {recoverInterruptedAssessments,maxFullAssessmentMs} from './assessment-recovery.js';
+import {evidenceSigningKey,verifyEvidenceSignature} from './evidence-signing.js';
+import {verifyAuditChain,checkpointAuditChain,startAuditCheckpointer} from './audit-chain.js';
 import {initScannerJobs,enqueueScannerJob,listScannerJobs,claimScannerJob,recoverStaleScannerJobs,executeClaimedScannerJob,scannerRegistry} from './scanner-jobs.js';
 import { analyzeIntel } from './intel-ai.js';
 import {offensiveCapabilityCatalog,defensiveAssessment,securityWorkspaceSummary} from './security-operations.js';
@@ -128,6 +130,8 @@ await initSecurityFindingProposals();
 await initScannerJobs();
 await recoverStaleScannerJobs();
 {const recovered=await recoverInterruptedAssessments([],0);if(recovered.length)console.warn('[AEGIS RECOVERY] marked '+recovered.length+' orphaned RUNNING assessment(s) INTERRUPTED');}
+evidenceSigningKey(); // fails closed in production without a real EVIDENCE_HMAC_KEY
+if(process.env.DATABASE_URL)startAuditCheckpointer();
 
 app.disable('x-powered-by');
 app.use((req,res,next)=>{const started=process.hrtime.bigint();res.on('finish',()=>{const latencyMs=Number(process.hrtime.bigint()-started)/1e6;recordHttpObservation(res.statusCode,latencyMs)});next()});
@@ -630,6 +634,9 @@ function run(cmd:string,args:string[]){
     child.on('close',code=>{if(!done){done=true;clearTimeout(timer);resolve({stdout:out,stderr:err,exitCode:code,durationMs:Date.now()-started,timedOut,stdoutTruncated,stderrTruncated})}});
   });
 }
+app.get('/api/admin/audit-chain/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});if(!['grc_reviewer','admin'].includes(String(await userRole(u.userId))))return res.status(403).json({error:'Reviewer or admin role required'});const report=await verifyAuditChain();res.status(report.status==='BROKEN'?409:200).json(report)}catch(e:any){res.status(503).json({error:'Audit chain verification unavailable',detail:String(e?.message||e)})}});
+app.post('/api/admin/audit-chain/checkpoint',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});if(String(await userRole(u.userId))!=='admin')return res.status(403).json({error:'Admin role required'});res.json(await checkpointAuditChain())}catch(e:any){res.status(503).json({error:String(e?.message||e)})}});
+app.get('/api/assessments/:id/evidence/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const a=await db.assessmentForUser(u.userId,req.params.id);if(!a)return res.status(404).json({error:'Assessment not found'});const rows=await db.evidenceForAssessment(a.id);const results=rows.map(x=>({id:x.id,source:x.source,sha256:x.sha256,createdAt:x.createdAt,...verifyEvidenceSignature(x)}));const counts=results.reduce((m:any,x)=>{m[x.status]=(m[x.status]||0)+1;return m},{});res.status(results.some(x=>x.status==='INVALID')?409:200).json({assessmentId:a.id,total:results.length,counts,results})}catch(e:any){res.status(500).json({error:String(e?.message||e)})}});
 app.get('/api/ready',async(_req,res)=>{try{res.json(await db.ready())}catch(e:any){res.status(503).json({ok:false,error:e.message})}});
 app.get('/api/health',async(_req,res)=>{
  const check=async(cmd:string,args:string[])=>{try{const r=await run(cmd,args);return {available:r.exitCode===0,version:(r.stdout||r.stderr).split('\n')[0]}}catch(e:any){return {available:false,error:e.message}}};
