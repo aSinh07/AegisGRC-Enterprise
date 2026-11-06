@@ -21,7 +21,11 @@ services:
       DATABASE_URL: postgres://aegis:aegis-local@postgres:5432/aegis
       PGSSL: disable
       ASSESSMENT_SESSION_SECRET: local-development-secret-change-me
-      EVIDENCE_HMAC_KEY: local-development-evidence-key-change-me
+      # Local-only keys. The image runs with NODE_ENV=production, which refuses placeholder keys.
+      EVIDENCE_HMAC_KEY: local-dev-only-evidence-hmac-key-0123456789
+      REPORT_SIGNING_KEY: local-dev-only-report-signing-key-0123456789
+      # Local trials: self-attested targets. Production (.env.production) enforces DNS/file proof + approver.
+      TARGET_AUTHORIZATION_MODE: attest
     depends_on:
       postgres:
         condition: service_healthy
