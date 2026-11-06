@@ -56,6 +56,7 @@ import {correlateExposure} from './exposure-prioritization.js';
 import { parseFindingImport } from './finding-import.js';
 import { initFindingReview,reviewFinding,findingReviewHistory } from './finding-review.js';
 import { initFindingRisk,slaPolicy,setSlaPolicy,promoteFindingToIssue } from './finding-risk.js';
+import {initFindingPromotion,promotionPolicy,setPromotionPolicy,autoPromoteConfirmedFinding,runPromotionSweep} from './finding-promotion.js';
 
 import { auditDocx,auditXlsx,auditPdf } from './audit-exporters.js';
 import { auditPackageModel } from './audit-trace.js';
@@ -125,6 +126,7 @@ await initGrcOperations();
 await initGrcAutomation();
 await initFindingReview();
 await initFindingRisk();
+await initFindingPromotion();
 await initAssessmentInventory();
 await initBreachAssessment();
 await initIncidentResponse();
@@ -343,7 +345,9 @@ app.post('/api/grc/assessments/:assessmentId/openvas-report',upload.single('file
 app.post('/api/grc/assessments/:assessmentId/findings/:findingId/review',async(req,res)=>{try{
  const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});
  const result=await reviewFinding(u.userId,req.params.assessmentId,req.params.findingId,req.body||{});
- res.json(result);
+ // Analyst confirmation triggers policy-driven Finding → Issue → Risk → CAPA promotion (opt-in per organization).
+ let promotion=null;if(String(req.body?.decision||'').toUpperCase()==='CONFIRMED'){const access=await requireAssessmentAccess(u.userId,req.params.assessmentId);promotion=await autoPromoteConfirmedFinding(access.organization_id,req.params.assessmentId,req.params.findingId,u.userId)}
+ res.json(promotion?{...result,promotion}:result);
  }catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.get('/api/grc/assessments/:assessmentId/findings/:findingId/grc-recommendation',async(req,res)=>{try{
  const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});
@@ -356,6 +360,9 @@ app.get('/api/grc/assessments/:assessmentId/findings/:findingId/reviews',async(r
  const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});
  res.json({reviews:await findingReviewHistory(u.userId,req.params.assessmentId,req.params.findingId)});
  }catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.get('/api/grc/organizations/:orgId/promotion-policy',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json({policy:await promotionPolicy(u.userId,req.params.orgId)})}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.put('/api/grc/organizations/:orgId/promotion-policy',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json({policy:await setPromotionPolicy(u.userId,req.params.orgId,req.body||{})})}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.post('/api/grc/organizations/:orgId/promotion/run',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await runPromotionSweep(u.userId,req.params.orgId))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.get('/api/grc/organizations/:orgId/sla-policy',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json({policy:await slaPolicy(u.userId,req.params.orgId),note:'Organization policy; defaults are configurable operational targets, not regulatory promises.'})}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.put('/api/grc/organizations/:orgId/sla-policy',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json({policy:await setSlaPolicy(u.userId,req.params.orgId,req.body||{})})}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.post('/api/grc/organizations/:orgId/assessments/:assessmentId/findings/:findingId/issue',async(req,res)=>{try{

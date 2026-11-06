@@ -273,3 +273,51 @@ test('targeted retest supports http and sqlmap, and a failed posture probe can n
  const ui=await readFile(new URL('../public/dashboard.js',import.meta.url),'utf8');
  assert.match(ui,/\['nmap','wapiti','zap','nuclei','sqlmap','http'\]\.includes/);
 });
+
+// ── Gap: Finding → Risk → CAPA promotion is manual ──────────────────────────
+import {atOrAbove,derivedRiskRating} from '../src/finding-promotion.js';
+test('promotion threshold and severity-derived risk ratings',()=>{
+ assert.equal(atOrAbove('CRITICAL','HIGH'),true);assert.equal(atOrAbove('MEDIUM','HIGH'),false);assert.equal(atOrAbove('HIGH','HIGH'),true);
+ assert.deepEqual(derivedRiskRating('CRITICAL'),{likelihood:4,impact:5});
+ assert.deepEqual(derivedRiskRating('HIGH'),{likelihood:4,impact:4});
+});
+test('confirming a finding auto-creates one issue, risk and CAPA under the policy owner, idempotently',{skip:!ciDb},async()=>{
+ const {initGrcCore}=await import('../src/grc-core.js');
+ const {initOrganizations,createOrganization,addMember}=await import('../src/grc-organizations.js');
+ const {initIssueRiskCapa}=await import('../src/grc-remediation.js');
+ const {initFindingReview,reviewFinding}=await import('../src/finding-review.js');
+ const {initFindingRisk}=await import('../src/finding-risk.js');
+ const fp=await import('../src/finding-promotion.js');
+ const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:false});
+ try{
+  await initGrcCore();await initOrganizations();await initIssueRiskCapa();await initFindingReview();await initFindingRisk();await fp.initFindingPromotion();
+  const mk=async()=>{const id=crypto.randomUUID();await pool.query("INSERT INTO app_users(id,email,password_hash,password_salt,totp_secret) VALUES($1,$2,'x','x','x')",[id,id+'@t.example']);return id};
+  const manager=await mk(),analyst=await mk();
+  const org:any=await createOrganization(manager,{name:'Promo '+manager.slice(0,8)});const orgId=org.id||org.organization?.id;
+  await addMember(manager,orgId,analyst,'SECURITY_ANALYST');
+  const aid=crypto.randomUUID();
+  await pool.query("INSERT INTO assessments(id,target,authorized_at,status,payload,organization_id,created_by) VALUES($1,'https://example.com',now(),'COMPLETED','{}',$2,$3)",[aid,orgId,manager]);
+  const mkFinding=async(severity:string)=>{const id=crypto.randomUUID();const f={id,assessmentId:aid,source:'nuclei',title:'Finding '+severity+' '+id.slice(0,6),description:'d',severity,asset:'https://example.com',evidenceHash:'e'.repeat(64),createdAt:new Date().toISOString(),mappings:{},remediation:'Patch the component and retest.'};await pool.query('INSERT INTO findings(id,assessment_id,severity,source,created_at,payload) VALUES($1,$2,$3,$4,now(),$5)',[id,aid,severity,'nuclei',f]);return id};
+  const high=await mkFinding('HIGH'),medium=await mkFinding('MEDIUM');
+  // Disabled by default: nothing is created.
+  await reviewFinding(analyst,aid,high,{decision:'CONFIRMED',rationale:'Reproduced manually in staging'});
+  assert.equal((await fp.autoPromoteConfirmedFinding(orgId,aid,high,analyst)).reason,'POLICY_DISABLED');
+  await assert.rejects(fp.setPromotionPolicy(analyst,orgId,{enabled:true}),/Insufficient organization role/,'only risk managers set the policy');
+  await fp.setPromotionPolicy(manager,orgId,{enabled:true,minSeverity:'HIGH'});
+  const out=await fp.autoPromoteConfirmedFinding(orgId,aid,high,analyst);
+  assert.equal(out.status,'PROMOTED',out.reason);assert.ok(out.issueId&&out.riskId&&out.capaId);
+  const risk=(await pool.query('SELECT inherent_score,treatment,created_by FROM grc_enterprise_risks WHERE id=$1',[out.riskId])).rows[0];
+  assert.equal(risk.inherent_score,16);assert.equal(risk.treatment,'MITIGATE');assert.equal(risk.created_by,manager);
+  const again=await fp.autoPromoteConfirmedFinding(orgId,aid,high,analyst);assert.equal(again.reason,'ALREADY_PROMOTED');
+  assert.equal(Number((await pool.query('SELECT count(*) c FROM grc_capa WHERE issue_id=$1',[out.issueId])).rows[0].c),1);
+  await reviewFinding(analyst,aid,medium,{decision:'CONFIRMED',rationale:'Reproduced manually in staging'});
+  assert.equal((await fp.autoPromoteConfirmedFinding(orgId,aid,medium,analyst)).reason,'BELOW_THRESHOLD');
+  // Unconfirmed findings are never promoted, even by the sweep.
+  const unreviewed=await mkFinding('CRITICAL');
+  const sweep=await fp.runPromotionSweep(manager,orgId);assert.ok(!sweep.outcomes.some(x=>x.findingId===unreviewed));
+  // Policy owner losing authority makes automation fail closed.
+  await pool.query("UPDATE grc_promotion_policies SET owner_user_id=$2 WHERE organization_id=$1",[orgId,analyst]);
+  const critical=await mkFinding('CRITICAL');await reviewFinding(analyst,aid,critical,{decision:'CONFIRMED',rationale:'Reproduced manually in staging'});
+  const failed=await fp.autoPromoteConfirmedFinding(orgId,aid,critical,analyst);assert.equal(failed.status,'FAILED');assert.match(String(failed.reason),/Insufficient organization role/);
+ }finally{await pool.end()}
+});
