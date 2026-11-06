@@ -333,11 +333,12 @@ async function scan(){
  if(!assessmentId||!sessionToken)return raw.textContent='Authorize the target first inside Offensive Security.';
  if(tool.value==='quick')return quickScan();
  try{
-  const full=tool.value==='all';
+  const full=['all','deep','quick-profile'].includes(tool.value);
   raw.textContent=full?'SUBMITTING FULL URL ASSESSMENT…':'Executing deep real '+tool.value+' scan…';state.textContent='SCANNING';offensiveInfer();
   if(full){const box=document.getElementById('urlAnalysisSummary');if(box)box.innerHTML='<div class="capability-card"><b>STARTING</b><small>Submitting authorized assessment</small></div>';gate.textContent='STARTING · '+assessmentId+' · '+targetOrigin}
   const d=await jf('/api/scans/run',{method:'POST',headers:{'Content-Type':'application/json','x-assessment-session':sessionToken},body:JSON.stringify({targetUrl:targetOrigin,tool:tool.value})});
-  if(full&&d.status==='RUNNING'){gate.textContent='RUNNING · '+assessmentId+' · '+targetOrigin+' · server-side assessment accepted';raw.textContent='ASSESSMENT ACCEPTED\n\nThe server is executing HTTP posture, Nuclei, bounded Nmap discovery, ZAP, Wapiti and SQLmap. This page now polls persisted PostgreSQL evidence; no long proxy request is held open.';await pollFullAssessment();return}
+  if(full&&d.status==='AWAITING_APPROVAL'){gate.textContent='AWAITING APPROVAL · '+assessmentId+' · deep scan job '+(d.scanJob&&d.scanJob.id||'');raw.textContent='DEEP SCAN QUEUED\n\n'+d.message+'\n\nOpen Governed Lifecycle to see the approval and job status.';state.textContent='AWAITING_APPROVAL';return}
+  if(full&&d.status==='RUNNING'){gate.textContent='RUNNING · '+assessmentId+' · '+targetOrigin+' · server-side assessment accepted';raw.textContent='ASSESSMENT ACCEPTED\n\nA scanner worker is executing each tool of the selected profile against the pinned target address. This page polls persisted PostgreSQL evidence; no long proxy request is held open.';await pollFullAssessment();return}
   raw.textContent=JSON.stringify(d,null,2);state.textContent=full?(d.status==='COMPLETED'?'SCANNED':d.status==='PARTIAL'?'PARTIAL':'FAILED'):(d.exitCode===0?'SCANNED':'FAILED');await report()
  }catch(e){raw.textContent='ASSESSMENT START FAILED · '+e.message;state.textContent='FAILED';gate.textContent='ANALYSIS FAILED · '+e.message;try{await report()}catch{}}
 }

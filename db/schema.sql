@@ -250,3 +250,62 @@ DROP TRIGGER IF EXISTS report_records_append_only ON report_records;
 CREATE TRIGGER report_records_append_only BEFORE UPDATE OR DELETE ON report_records FOR EACH ROW EXECUTE FUNCTION aegis_forbid_evidence_mutation();
 DROP TRIGGER IF EXISTS report_records_no_truncate ON report_records;
 CREATE TRIGGER report_records_no_truncate BEFORE TRUNCATE ON report_records FOR EACH STATEMENT EXECUTE FUNCTION aegis_forbid_evidence_mutation();
+
+-- Durable URL scan jobs (profile + approval) and their per-tool tasks (leased by a scanner worker).
+CREATE TABLE IF NOT EXISTS url_scan_jobs(
+ id uuid PRIMARY KEY,
+ organization_id uuid NOT NULL REFERENCES grc_organizations(id) ON DELETE RESTRICT,
+ assessment_id uuid NOT NULL REFERENCES assessments(id) ON DELETE RESTRICT,
+ target_authorization_id uuid REFERENCES target_authorizations(id) ON DELETE RESTRICT,
+ origin text NOT NULL,
+ hostname text NOT NULL,
+ pinned_addresses text[] NOT NULL,
+ profile text NOT NULL CHECK(profile IN ('QUICK','STANDARD','DEEP')),
+ purpose text NOT NULL DEFAULT 'ASSESSMENT' CHECK(purpose IN ('ASSESSMENT','SCHEDULED')),
+ status text NOT NULL CHECK(status IN ('AWAITING_APPROVAL','QUEUED','RUNNING','COMPLETED','PARTIAL','FAILED','REJECTED','CANCELLED')),
+ requested_by uuid REFERENCES app_users(id) ON DELETE RESTRICT,
+ approved_by uuid REFERENCES app_users(id) ON DELETE RESTRICT,
+ approved_at timestamptz,
+ decision_note text,
+ coverage jsonb,
+ created_at timestamptz NOT NULL DEFAULT now(),
+ started_at timestamptz,
+ completed_at timestamptz,
+ CONSTRAINT url_scan_jobs_separation_of_duties CHECK(approved_by IS NULL OR approved_by<>requested_by)
+);
+CREATE INDEX IF NOT EXISTS url_scan_jobs_assessment_idx ON url_scan_jobs(assessment_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS url_scan_jobs_org_status_idx ON url_scan_jobs(organization_id,status);
+CREATE TABLE IF NOT EXISTS url_scan_tasks(
+ id uuid PRIMARY KEY,
+ job_id uuid NOT NULL REFERENCES url_scan_jobs(id) ON DELETE RESTRICT,
+ tool text NOT NULL CHECK(tool IN ('http','nmap','nuclei','wapiti','zap','sqlmap')),
+ options jsonb NOT NULL DEFAULT '{}'::jsonb,
+ state text NOT NULL CHECK(state IN ('BLOCKED','QUEUED','LEASED','SUCCEEDED','FAILED','TIMEOUT','CANCELLED')),
+ attempts int NOT NULL DEFAULT 0,
+ max_attempts int NOT NULL DEFAULT 2,
+ lease_owner text,
+ lease_token text,
+ lease_expires_at timestamptz,
+ evidence_id uuid,
+ evidence_sha256 text,
+ finding_count int,
+ error text,
+ created_at timestamptz NOT NULL DEFAULT now(),
+ started_at timestamptz,
+ completed_at timestamptz,
+ UNIQUE(job_id,tool)
+);
+CREATE INDEX IF NOT EXISTS url_scan_tasks_queue_idx ON url_scan_tasks(state,created_at);
+-- Replay protection for signed scanner-worker requests.
+CREATE TABLE IF NOT EXISTS scanner_worker_nonces(
+ worker_id text NOT NULL,
+ nonce text NOT NULL,
+ seen_at timestamptz NOT NULL DEFAULT now(),
+ PRIMARY KEY(worker_id,nonce)
+);
+CREATE TABLE IF NOT EXISTS scanner_workers(
+ id text PRIMARY KEY,
+ last_seen_at timestamptz,
+ last_ip text,
+ version text
+);

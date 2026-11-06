@@ -16,11 +16,15 @@ async function api(path:string,params:Record<string,string>={}){
 }
 export async function zapReady(){try{await api('/JSON/core/view/version/');return true}catch{return false}}
 async function wait(path:string,id:string,limitMs=120000){const started=Date.now();while(Date.now()-started<limitMs){const d=await api(path,{scanId:id});const n=Number(d.status||0);if(n>=100)return;await pause(1500)}throw new Error('ZAP scan timed out')}
-export async function zapScan(target:string){
+export type ZapMode='active'|'passive';
+async function waitPassive(limitMs=60000){const started=Date.now();while(Date.now()-started<limitMs){const d=await api('/JSON/pscan/view/recordsToScan/');if(Number(d.recordsToScan||0)===0)return;await pause(1500)}throw new Error('ZAP passive scan timed out')}
+// 'passive' = spider + passive rules only (no attack traffic); 'active' adds the active scanner.
+export async function zapScan(target:string,mode:ZapMode='active'){
  const spider=await api('/JSON/spider/action/scan/',{url:target,maxChildren:'20',recurse:'true',subtreeOnly:'true'});
  if(!spider.scan)throw new Error('ZAP spider did not start');await wait('/JSON/spider/view/status/',String(spider.scan),90000);
- const active=await api('/JSON/ascan/action/scan/',{url:target,recurse:'true',inScopeOnly:'false'});
- if(!active.scan)throw new Error('ZAP active scan did not start');await wait('/JSON/ascan/view/status/',String(active.scan),120000);
+ if(mode==='passive')await waitPassive();
+ else{const active=await api('/JSON/ascan/action/scan/',{url:target,recurse:'true',inScopeOnly:'false'});
+ if(!active.scan)throw new Error('ZAP active scan did not start');await wait('/JSON/ascan/view/status/',String(active.scan),120000)}
  const alerts=await api('/JSON/core/view/alerts/',{baseurl:target,start:'0',count:'500'});
  return Array.isArray(alerts.alerts)?alerts.alerts:[];
 }
@@ -33,10 +37,10 @@ async function setZapUpstream(host:string,port:number,enabled:boolean){
 }
 let zapQueue:Promise<unknown>=Promise.resolve();
 export function zapEgressProxyHost(env:NodeJS.ProcessEnv=process.env){return String(env.ZAP_EGRESS_PROXY_HOST||'').trim()}
-export async function zapScanPinned(t:PinnedTarget){
+export async function zapScanPinned(t:PinnedTarget,mode:ZapMode='active'){
  const host=zapEgressProxyHost();
  if(!host)throw new Error('ZAP_EGRESS_PROXY_HOST is not configured: ZAP scans fail closed without DNS-pinned egress');
- const job=()=>withPinnedEgress(t,async p=>{await setZapUpstream(host,p.port,true);try{return await zapScan(t.url.origin)}finally{await setZapUpstream('',0,false).catch(()=>{})}},{bindHost:'0.0.0.0'});
+ const job=()=>withPinnedEgress(t,async p=>{await setZapUpstream(host,p.port,true);try{return await zapScan(t.url.origin,mode)}finally{await setZapUpstream('',0,false).catch(()=>{})}},{bindHost:'0.0.0.0'});
  const next=zapQueue.then(job,job);zapQueue=next.catch(()=>{});return next;
 }
 function sev(risk:string):Severity{const x=risk.toLowerCase();return x.includes('high')?'HIGH':x.includes('medium')?'MEDIUM':x.includes('low')?'LOW':'INFO'}

@@ -91,6 +91,12 @@ import {evidenceSigningKey,verifyEvidenceSignature} from './evidence-signing.js'
 import {pinnedAddress,withPinnedEgress,pinnedHttpGet} from './pinned-egress.js';
 import {scannerArgs,nucleiTemplatesPin} from './scanner-args.js';
 import {pool as dbPool} from './db-pool.js';
+import {httpPostureFindings} from './http-posture.js';
+import os from 'node:os';
+import {runScanTask,type RawScanResult} from './scan-runner.js';
+import {SCAN_PROFILES,enqueueUrlScanJob,decideUrlScanJob,listUrlScanJobs,pendingScanApprovals,claimUrlScanTask,heartbeatUrlScanTask,completeUrlScanTask,recoverExpiredScanLeases,activeScanAssessmentIds} from './url-scan-jobs.js';
+import {installScanJobPersistence} from './scan-job-persistence.js';
+import {parseWorkerKeys,verifyWorkerRequest,verifyScanOutput,rawOutputDigest} from './worker-protocol.js';
 import {runtimeManagesSchema,databaseRolePosture} from './schema-init.js';
 import {recordSignedReport,reportHeaders,verifyReportRecord,verifyReportBytes} from './report-records.js';
 import {requestTargetAuthorization,verifyTargetAuthorization,decideTargetAuthorization,revokeTargetAuthorization,listTargetAuthorizations,targetAuthorizationBasis,assertTargetAuthorized} from './target-authorization.js';
@@ -141,7 +147,8 @@ await initScannerJobs();
 }
 if(process.env.DATABASE_URL){const posture=await databaseRolePosture();if(!posture.hardened){const msg='[AEGIS DB] runtime role '+posture.role+' is '+(posture.superuser?'a superuser':posture.ownsSchema?'the schema owner':'allowed to create objects')+'; database triggers are not a hard control for this role';if(String(process.env.AEGIS_REQUIRE_NON_OWNER_DB_ROLE||'').toLowerCase()==='true')throw new Error(msg);console.warn(msg)}}
 await recoverStaleScannerJobs();
-{const recovered=await recoverInterruptedAssessments([],0);if(recovered.length)console.warn('[AEGIS RECOVERY] marked '+recovered.length+' orphaned RUNNING assessment(s) INTERRUPTED');}
+{// Durable scan jobs survive restarts: their assessments stay RUNNING and workers resume them.
+const recovered=await recoverInterruptedAssessments(process.env.DATABASE_URL?await activeScanAssessmentIds():[],0);if(recovered.length)console.warn('[AEGIS RECOVERY] marked '+recovered.length+' orphaned RUNNING assessment(s) INTERRUPTED');}
 evidenceSigningKey(); // fails closed in production without a real EVIDENCE_HMAC_KEY
 if(process.env.DATABASE_URL)startAuditCheckpointer();
 
@@ -164,6 +171,8 @@ app.use((req,res,next)=>{
  if(unsafe&&String(req.headers['sec-fetch-site']||'').toLowerCase()==='cross-site')return res.status(403).json({error:'Cross-site state-changing requests are not allowed'});
  next();
 });
+// Scanner-worker API: larger bodies, raw bytes kept for request-signature verification.
+app.use('/api/worker/v1',express.json({limit:'12mb',verify:(req:any,_res,buf)=>{req.rawBody=Buffer.from(buf)}}));
 app.use(express.json({limit:'1mb'}));
 app.use('/api',(req,res,next)=>{
  const supplied=String(req.headers['x-request-id']||'').trim();
@@ -213,6 +222,22 @@ app.post('/api/auth/reset-password',async(req,res)=>{try{const email=String(req.
 app.post('/api/auth/logout',async(req,res)=>{const token=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('aegis_auth='))?.slice(11)||'';logout(token);const ut=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('aegis_user='))?.slice(11)||'';await userLogout(ut);res.setHeader('Set-Cookie',['aegis_auth=; HttpOnly; Secure; SameSite=Strict; Max-Age=0; Path=/','aegis_user=; HttpOnly; Secure; SameSite=Strict; Max-Age=0; Path=/']);res.json({ok:true})});
 app.get('/api/auth/status',async(req,res)=>{const ut=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('aegis_user='))?.slice(11)||'';res.json({authenticated:Boolean(await userSession(ut)),configured:true,legacyAdminConfigured:authConfigured()})});
 app.post('/api/security/telemetry/wazuh/:orgId/:sourceKey',async(req,res)=>{try{const auth=String(req.headers.authorization||'');const token=auth.startsWith('Bearer ')?auth.slice(7).trim():'';const rateKey='telemetry:wazuh:'+String(req.ip||req.socket?.remoteAddress||'unknown')+':'+req.params.orgId+':'+req.params.sourceKey;if(!await consumeRateLimit(rateKey,1200,1))return res.status(429).json({error:'Telemetry ingestion rate limit exceeded'});const out=await ingestWazuhTelemetry(req.params.orgId,req.params.sourceKey,token,req.body);res.status(202).json(out)}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+// Remote worker API (pull-only). Registered before the user-session gate: workers authenticate with signed requests, not cookies. Authenticated per request; see src/worker-protocol.ts.
+async function workerAuth(req:any,res:any){
+ let keys:Map<string,string>;try{keys=parseWorkerKeys()}catch(e:any){res.status(503).json({error:e.message});return null}
+ if(!keys.size){res.status(404).json({error:'Remote scanner workers are not enabled'});return null}
+ const r=await verifyWorkerRequest(req.headers,req.method,String(req.originalUrl||'').split('?')[0],req.rawBody||Buffer.alloc(0),keys,async(w,n)=>Boolean((await dbPool.query('INSERT INTO scanner_worker_nonces(worker_id,nonce) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1',[w,n])).rows[0]));
+ if(!r.ok){res.status(401).json({error:'Worker authentication failed',reason:r.reason});return null}
+ await dbPool.query('INSERT INTO scanner_workers(id,last_seen_at,last_ip,version) VALUES($1,now(),$2,$3) ON CONFLICT(id) DO UPDATE SET last_seen_at=now(),last_ip=EXCLUDED.last_ip,version=EXCLUDED.version',[r.workerId,String(req.ip||''),String(req.headers['x-aegis-worker-version']||'').slice(0,64)]);
+ return {workerId:r.workerId,secret:keys.get(r.workerId)!};
+}
+app.post('/api/worker/v1/claim',async(req,res)=>{try{const w=await workerAuth(req,res);if(!w)return;const tools=Array.isArray(req.body?.tools)?req.body.tools.map(String):undefined;const lease=await claimUrlScanTask(w.workerId,{tools});if(!lease)return res.status(204).end();res.json(lease)}catch(e:any){res.status(e.statusCode||500).json({error:e.message})}});
+app.post('/api/worker/v1/tasks/:id/heartbeat',async(req,res)=>{try{const w=await workerAuth(req,res);if(!w)return;res.json(await heartbeatUrlScanTask(req.params.id,w.workerId,String(req.body?.leaseToken||'')))}catch(e:any){res.status(e.statusCode||500).json({error:e.message})}});
+app.post('/api/worker/v1/tasks/:id/result',async(req,res)=>{try{const w=await workerAuth(req,res);if(!w)return;
+ const raw=req.body?.raw??null,failure=req.body?.failure?String(req.body.failure):undefined;
+ let attestation:Record<string,unknown>={mode:'REMOTE',workerId:w.workerId,receivedAt:new Date().toISOString()};
+ if(raw){if(!verifyScanOutput(w.secret,req.params.id,raw,String(req.body?.outputSignature||'')))return res.status(400).json({error:'Scan output signature is invalid; result rejected'});attestation={...attestation,outputSignature:String(req.body.outputSignature),outputDigest:rawOutputDigest(raw),signatureVerified:true}}
+ res.json(await completeUrlScanTask(req.params.id,w.workerId,String(req.body?.leaseToken||''),raw,attestation,failure))}catch(e:any){res.status(e.statusCode||500).json({error:e.message})}});
 app.use('/api',async(req,res,next)=>{if(['/ready','/auth/login','/auth/user-login','/auth/register','/auth/register/confirm','/auth/reset-password','/auth/status'].includes(req.path))return next();const ut=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('aegis_user='))?.slice(11)||'';if(!await userSession(ut))return res.status(401).json({error:'User login required'});next()});
 app.get('/api/auth/profile',async(req,res)=>{const ut=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('aegis_user='))?.slice(11)||'';const profile=await userSession(ut);if(!profile)return res.status(401).json({error:'User session required'});res.json({profile})});
 
@@ -605,17 +630,9 @@ async function quickPosture(assessmentId:string,t:{url:URL,addresses:string[]}){
  // Pinned to the validated address: the probe never re-resolves the hostname (DNS-rebinding defence).
  try{const r=await pinnedHttpGet(t,1200,{'User-Agent':'AegisGRC-Posture/1.0'});status=r.status;headers=Object.fromEntries(Object.entries(r.headers).map(([k,v])=>[k,Array.isArray(v)?v.join(', '):String(v??'')]))}
  catch(e:any){error=e?.name==='AbortError'?'HTTP posture probe exceeded 1.2s':String(e?.message||e)}
- const checks=[
-  {bad:t.url.protocol!=='https:',title:'Transport is not HTTPS',severity:'HIGH',cvss:7.4,desc:'The authorized target uses plaintext HTTP.',rem:'Enforce HTTPS and redirect HTTP to HTTPS.'},
-  {bad:!headers['strict-transport-security']&&t.url.protocol==='https:',title:'HSTS header not observed',severity:'MEDIUM',cvss:5.3,desc:'Strict-Transport-Security was not observed in the live HTTP response.',rem:'Enable HSTS after validating HTTPS coverage.'},
-  {bad:!headers['content-security-policy'],title:'Content Security Policy not observed',severity:'MEDIUM',cvss:5.3,desc:'Content-Security-Policy was not observed in the live HTTP response.',rem:'Deploy a restrictive CSP appropriate to the application.'},
-  {bad:!headers['x-content-type-options'],title:'MIME sniffing protection not observed',severity:'LOW',cvss:3.1,desc:'X-Content-Type-Options was not observed.',rem:'Set X-Content-Type-Options: nosniff.'},
-  {bad:!headers['x-frame-options']&&!String(headers['content-security-policy']||'').includes('frame-ancestors'),title:'Framing protection not observed',severity:'MEDIUM',cvss:4.3,desc:'Neither X-Frame-Options nor CSP frame-ancestors was observed.',rem:'Set CSP frame-ancestors or X-Frame-Options.'},
-  {bad:Boolean(headers['server']),title:'Server technology disclosed',severity:'LOW',cvss:2.6,desc:'The live response exposes a Server header: '+String(headers['server']||''),rem:'Minimize unnecessary server banner disclosure.'}
- ] as const;
  const evidence=JSON.stringify({kind:'LIVE_HTTP_POSTURE',target:t.url.origin,status,headers,error,addresses:t.addresses});
  const sha256=crypto.createHash('sha256').update(evidence).digest('hex');
- const findings:any[]=checks.filter(x=>x.bad).map(x=>({id:crypto.randomUUID(),assessmentId,source:'http',title:x.title,description:x.desc,severity:x.severity,cvss:x.cvss,asset:t.url.origin,evidenceHash:sha256,createdAt,mappings:{owasp:['A05:2025 Security Misconfiguration'],nistCsf:['PR.PS']},remediation:x.rem,status:'OPEN'}));
+ const findings:any[]=httpPostureFindings(assessmentId,t.url,headers,sha256,createdAt);
  return {startedAt:createdAt,completedAt:new Date().toISOString(),durationMs:Date.now()-started,status,headers,error,sha256,findings};
 }
 function documentSecurityScan(file:Express.Multer.File){
@@ -658,6 +675,28 @@ app.post('/api/grc/organizations/:orgId/target-authorizations',async(req,res)=>{
 app.post('/api/grc/organizations/:orgId/target-authorizations/:id/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const out=await verifyTargetAuthorization(u.userId,req.params.orgId,req.params.id);res.status(out.verified?200:409).json(out)}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.post('/api/grc/organizations/:orgId/target-authorizations/:id/decision',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await decideTargetAuthorization(u.userId,req.params.orgId,req.params.id,req.body||{}))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.post('/api/grc/organizations/:orgId/target-authorizations/:id/revoke',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await revokeTargetAuthorization(u.userId,req.params.orgId,req.params.id,String(req.body?.reason||'')))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+// ── Durable scan jobs and scanner workers ───────────────────────────────────
+installScanJobPersistence();
+app.get('/api/scan-profiles',(_req,res)=>res.json({profiles:Object.entries(SCAN_PROFILES).map(([id,p])=>({id,tools:p.tasks.map(t=>t.tool+(t.options?.zapMode?':'+t.options.zapMode:'')),requiresApproval:p.requiresApproval,description:p.description}))}));
+app.post('/api/assessments/:id/scan-jobs',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.status(202).json(await enqueueUrlScanJob(u.userId,req.params.id,{profile:String(req.body?.profile||'STANDARD')}))}catch(e:any){res.status(e.statusCode||400).json({error:e.message,code:e.code})}});
+app.get('/api/assessments/:id/scan-jobs',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json({jobs:await listUrlScanJobs(u.userId,req.params.id)})}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.post('/api/scan-jobs/:id/decision',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await decideUrlScanJob(u.userId,req.params.id,req.body||{}))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.get('/api/grc/organizations/:orgId/scan-approvals',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await pendingScanApprovals(u.userId,req.params.orgId))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+// Embedded worker: the same runner inside the app process (single-host deployments). Disabled with SCAN_WORKER_MODE=remote.
+const EMBEDDED_WORKER_ID='embedded:'+os.hostname();let embeddedRunning=0;
+async function embeddedWorkerTick(){
+ const limit=Math.max(1,Math.min(4,Number(process.env.EMBEDDED_WORKER_CONCURRENCY||2)));
+ while(embeddedRunning<limit){
+  const lease=await claimUrlScanTask(EMBEDDED_WORKER_ID);if(!lease)return;embeddedRunning++;
+  void (async()=>{try{let raw:RawScanResult|null=null,failure:string|undefined;try{raw=await runScanTask(lease.spec)}catch(e:any){failure=String(e?.message||e)}
+   await completeUrlScanTask(lease.taskId,EMBEDDED_WORKER_ID,lease.leaseToken,raw,{mode:'EMBEDDED',workerId:EMBEDDED_WORKER_ID,outputDigest:raw?rawOutputDigest(raw):null},failure)}
+   catch(e:any){console.error('[AEGIS SCAN JOB] embedded task failed',lease.taskId,String(e?.message||e))}finally{embeddedRunning--}})();
+ }
+}
+if(process.env.DATABASE_URL){
+ setInterval(()=>{recoverExpiredScanLeases().catch(e=>console.error('scan lease recovery',String(e?.message||e)))},60000).unref();
+ if(String(process.env.SCAN_WORKER_MODE||'embedded').toLowerCase()!=='remote')setInterval(()=>{embeddedWorkerTick().catch(e=>console.error('embedded worker',String(e?.message||e)))},Number(process.env.EMBEDDED_WORKER_POLL_MS||2000)).unref();
+}
 // Every governed PDF is persisted as a signed report record before it is returned.
 async function issueSignedPdf(res:any,input:Parameters<typeof recordSignedReport>[0]){if(db.mode()!=='postgres')return null;const rec=await recordSignedReport(input);for(const [k,v] of Object.entries(reportHeaders(rec)))res.setHeader(k,v);return rec}
 app.get('/api/reports/:id/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const out=await verifyReportRecord(u.userId,req.params.id);res.status(out.status==='VERIFIED'?200:out.status==='UNKNOWN_REPORT'?404:409).json(out)}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
@@ -812,7 +851,7 @@ app.post('/api/findings/:findingId/retest',async(req,res)=>{try{
  const status=rr.exitCode!==0?502:stillPresent?409:200;
  return res.status(status).json({execution:'TARGETED_RETEST',findingId:original.id,fingerprint,source:original.source,evidenceId:ev.id,evidence:{sha256:ev.sha256},exitCode:rr.exitCode,stillPresent,findings:rr.findings});
 }catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
-const activeFullScans=new Map<string,Promise<void>>();setInterval(()=>{recoverInterruptedAssessments(activeFullScans.keys(),maxFullAssessmentMs()).then(ids=>{if(ids.length)console.warn('[AEGIS RECOVERY] interrupted stale assessments',ids.join(','))}).catch(e=>console.error('assessment recovery error',String(e?.message||e)))},Number(process.env.ASSESSMENT_RECOVERY_POLL_MS||300000)).unref();
+const activeFullScans=new Map<string,Promise<void>>();setInterval(()=>{activeScanAssessmentIds().catch(()=>[] as string[]).then(jobIds=>recoverInterruptedAssessments([...activeFullScans.keys(),...jobIds],maxFullAssessmentMs())).then(ids=>{if(ids.length)console.warn('[AEGIS RECOVERY] interrupted stale assessments',ids.join(','))}).catch(e=>console.error('assessment recovery error',String(e?.message||e)))},Number(process.env.ASSESSMENT_RECOVERY_POLL_MS||300000)).unref();
 async function executeFullUrlAssessment(userId:string,assessment:Assessment,t:{url:URL,addresses:string[]}){
  const assessmentId=assessment.id;
  console.log('\n[AEGIS FULL ASSESSMENT] START '+t.url.origin+' assessment='+assessmentId);
@@ -842,9 +881,16 @@ app.post('/api/scans/run',async(req,res)=>{
     if(!assessment) return res.status(404).json({error:'Assessment not found; enter through the authorization gate first'});
     const access=await requireAssessmentAccess(u.userId,assessmentId);await requireOrgPermission(u.userId,access.organization_id,'manageAssessment');
     const tool=String(req.body.tool||'') as Tool;
-    if(!['nmap','wapiti','sqlmap','zap','nuclei','all'].includes(tool)) return res.status(400).json({error:'Tool is not enabled for real execution'});
+    if(!['nmap','wapiti','sqlmap','zap','nuclei','all','deep','quick-profile'].includes(tool)) return res.status(400).json({error:'Tool is not enabled for real execution'});
     const t=await validateTarget(String(req.body.targetUrl||''));
     if(t.url.origin!==session.targetOrigin || assessment.target!==session.targetOrigin) return res.status(403).json({error:'Target is outside the authorized assessment scope'});
+    if((tool as string)==='all'||(tool as string)==='deep'||(tool as string)==='quick-profile'){
+      // Full URL assessments run as a durable scan job leased by a scanner worker.
+      const profile=(tool as string)==='deep'?'DEEP':(tool as string)==='quick-profile'?'QUICK':String(req.body?.profile||'STANDARD').toUpperCase();
+      const job=await enqueueUrlScanJob(u.userId,assessmentId,{profile});
+      const pending=job.status==='AWAITING_APPROVAL';
+      return res.status(202).json({execution:'REAL_FULL_ASSESSMENT',status:pending?'AWAITING_APPROVAL':'RUNNING',assessmentId,target:t.url.origin,scanJob:{id:job.id,profile:job.profile,status:job.status,reused:job.reused},message:pending?'Deep scan queued. A GRC manager or org admin other than you must approve it before any traffic is sent.':'Assessment queued. A scanner worker executes each tool and evidence is persisted as it returns.'});
+    }
     if(tool==='all'){
       const existing=activeFullScans.get(assessmentId);
       if(existing)return res.status(202).json({execution:'REAL_FULL_ASSESSMENT',status:'RUNNING',assessmentId,target:t.url.origin,message:'Assessment is already running; poll the persisted workspace for progress.'});

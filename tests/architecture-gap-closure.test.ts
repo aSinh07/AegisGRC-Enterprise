@@ -54,8 +54,9 @@ test('technical, remediation and defensive PDFs render for interim and interrupt
 // Gap 3 — orphaned RUNNING full assessments are recovered after restart.
 test('server recovers orphaned RUNNING assessments at boot and periodically',async()=>{
  const s=await readFile(new URL('../src/server.ts',import.meta.url),'utf8');
- assert.match(s,/await recoverInterruptedAssessments\(\[\],0\)/);
- assert.match(s,/recoverInterruptedAssessments\(activeFullScans\.keys\(\),maxFullAssessmentMs\(\)\)/);
+ // Assessments with an active durable scan job are excluded (the job queue resumes them).
+ assert.match(s,/await recoverInterruptedAssessments\(process\.env\.DATABASE_URL\?await activeScanAssessmentIds\(\):\[\],0\)/);
+ assert.match(s,/recoverInterruptedAssessments\(\[\.\.\.activeFullScans\.keys\(\),\.\.\.jobIds\],maxFullAssessmentMs\(\)\)/);
  const store=await readFile(new URL('../src/store.ts',import.meta.url),'utf8');
  assert.match(store,/payload=EXCLUDED\.payload,updated_at=now\(\)/);
 });
