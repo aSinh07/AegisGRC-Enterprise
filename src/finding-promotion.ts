@@ -52,6 +52,12 @@ export async function setPromotionPolicy(user:string,org:string,input:any){
 
 export type PromotionOutcome={findingId:string;status:'PROMOTED'|'SKIPPED'|'FAILED';reason?:string;issueId?:string;riskId?:string;capaId?:string};
 
+/** Scanner findings map to the hardening control (posture/exposure) or the vulnerability-management control. */
+export function canonicalControlForSource(source:string){return source==='http'||source==='nmap'?'CFG-01':'VUL-01'}
+async function suggestedScopeControl(org:string,source:string){
+ return (await pool.query(`SELECT sc.id FROM grc_scope_controls sc JOIN grc_scopes s ON s.id=sc.scope_id JOIN grc_canonical_controls c ON c.id=sc.control_id
+  WHERE sc.organization_id=$1 AND s.status='ACTIVE' AND c.control_key=$2 AND sc.applicability<>'NOT_APPLICABLE' ORDER BY s.created_at,sc.created_at LIMIT 1`,[org,canonicalControlForSource(source)])).rows[0]?.id||null;
+}
 /** Promote one confirmed finding according to the org policy. Never throws; outcomes are audited. */
 export async function autoPromoteConfirmedFinding(org:string,assessmentId:string,findingId:string,triggeredBy:string):Promise<PromotionOutcome>{
  try{
@@ -60,12 +66,14 @@ export async function autoPromoteConfirmedFinding(org:string,assessmentId:string
   const f=(await pool.query('SELECT payload FROM findings WHERE id=$1 AND assessment_id=$2',[findingId,assessmentId])).rows[0]?.payload;
   if(!f)return {findingId,status:'SKIPPED',reason:'FINDING_NOT_FOUND'};
   if(!atOrAbove(f.severity,policy.min_severity))return {findingId,status:'SKIPPED',reason:'BELOW_THRESHOLD'};
+  if(f.duplicateOf)return {findingId,status:'SKIPPED',reason:'DUPLICATE_OF:'+f.duplicateOf};
   const done=(await pool.query(`SELECT i.id,(SELECT 1 FROM grc_issue_risks ir WHERE ir.issue_id=i.id LIMIT 1) AS has_risk,(SELECT 1 FROM grc_capa c WHERE c.issue_id=i.id AND c.organization_id=i.organization_id LIMIT 1) AS has_capa FROM grc_issues i WHERE i.organization_id=$1 AND i.finding_id=$2`,[org,findingId])).rows[0];
   if(done&&(!policy.create_risk||done.has_risk)&&(!policy.create_capa||done.has_capa))return {findingId,status:'SKIPPED',reason:'ALREADY_PROMOTED',issueId:done.id};
   const owner=policy.owner_user_id;
   if(!owner)throw new Error('Promotion policy has no owner');
   await requireOrgPermission(owner,org,'manageRisk'); // fail closed if the policy owner lost authority
-  const issue=await promoteFindingToIssue(owner,org,assessmentId,findingId,{});
+  const scopeControlId=await suggestedScopeControl(org,f.source);
+  const issue=await promoteFindingToIssue(owner,org,assessmentId,findingId,scopeControlId?{scopeControlId}:{});
   const out:PromotionOutcome={findingId,status:'PROMOTED',issueId:issue.id};
   if(policy.create_risk&&issue.status!=='CLOSED'){
    const r=derivedRiskRating(f.severity);

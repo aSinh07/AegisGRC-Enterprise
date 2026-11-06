@@ -96,6 +96,7 @@ import os from 'node:os';
 import {runScanTask,type RawScanResult} from './scan-runner.js';
 import {SCAN_PROFILES,enqueueUrlScanJob,decideUrlScanJob,listUrlScanJobs,pendingScanApprovals,claimUrlScanTask,heartbeatUrlScanTask,completeUrlScanTask,recoverExpiredScanLeases,activeScanAssessmentIds} from './url-scan-jobs.js';
 import {installScanJobPersistence} from './scan-job-persistence.js';
+import {assessmentLifecycle,phaseOneGate} from './lifecycle.js';
 import {parseWorkerKeys,verifyWorkerRequest,verifyScanOutput,rawOutputDigest} from './worker-protocol.js';
 import {runtimeManagesSchema,databaseRolePosture} from './schema-init.js';
 import {recordSignedReport,reportHeaders,verifyReportRecord,verifyReportBytes} from './report-records.js';
@@ -677,6 +678,8 @@ app.post('/api/grc/organizations/:orgId/target-authorizations/:id/decision',asyn
 app.post('/api/grc/organizations/:orgId/target-authorizations/:id/revoke',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await revokeTargetAuthorization(u.userId,req.params.orgId,req.params.id,String(req.body?.reason||'')))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 // ── Durable scan jobs and scanner workers ───────────────────────────────────
 installScanJobPersistence();
+app.get('/api/grc/assessments/:assessmentId/lifecycle',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await assessmentLifecycle(u.userId,req.params.assessmentId))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.get('/api/grc/organizations/:orgId/lifecycle-gate',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await phaseOneGate(u.userId,req.params.orgId))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.get('/api/scan-profiles',(_req,res)=>res.json({profiles:Object.entries(SCAN_PROFILES).map(([id,p])=>({id,tools:p.tasks.map(t=>t.tool+(t.options?.zapMode?':'+t.options.zapMode:'')),requiresApproval:p.requiresApproval,description:p.description}))}));
 app.post('/api/assessments/:id/scan-jobs',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.status(202).json(await enqueueUrlScanJob(u.userId,req.params.id,{profile:String(req.body?.profile||'STANDARD')}))}catch(e:any){res.status(e.statusCode||400).json({error:e.message,code:e.code})}});
 app.get('/api/assessments/:id/scan-jobs',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json({jobs:await listUrlScanJobs(u.userId,req.params.id)})}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});

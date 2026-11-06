@@ -6,6 +6,7 @@ export interface Finding {
  mappings:{owasp?:string[];iso27001?:string[];iso42001?:string[];nist?:string[];nistCsf?:string[];nistAiRmf?:string[];cis?:string[];soc2?:string[];pci?:string[];gdpr?:string[];dpdp?:string[];hipaa?:string[]};
  remediation?:string; status?:'OPEN'|'ACCEPTED'|'REMEDIATED'|'FALSE_POSITIVE'; owner?:string;
  confidence?:'OBSERVED'|'SCANNER_REPORTED'|'VALIDATED'|'CONFIRMED'; externalIds?:{cve?:string[];cwe?:string[];scannerId?:string}; fingerprint?:string;
+ duplicateOf?:string; occurrence?:number;
 }
 export interface Assessment {
  id:string; target:string; authorizedAt:string; status:'AUTHORIZED'|'RUNNING'|'COMPLETED'|'PARTIAL'|'FAILED'|'INTERRUPTED';

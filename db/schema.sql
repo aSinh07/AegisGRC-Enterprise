@@ -309,3 +309,17 @@ CREATE TABLE IF NOT EXISTS scanner_workers(
  last_ip text,
  version text
 );
+
+-- Persisted finding deduplication: one lineage row per (organization, fingerprint) across scanners and runs.
+CREATE TABLE IF NOT EXISTS finding_fingerprints(
+ organization_id uuid NOT NULL REFERENCES grc_organizations(id) ON DELETE RESTRICT,
+ fingerprint text NOT NULL,
+ canonical_finding_id uuid NOT NULL,
+ canonical_assessment_id uuid NOT NULL,
+ latest_finding_id uuid NOT NULL,
+ sources text[] NOT NULL DEFAULT '{}',
+ occurrences int NOT NULL DEFAULT 1,
+ first_seen_at timestamptz NOT NULL DEFAULT now(),
+ last_seen_at timestamptz NOT NULL DEFAULT now(),
+ PRIMARY KEY(organization_id,fingerprint)
+);

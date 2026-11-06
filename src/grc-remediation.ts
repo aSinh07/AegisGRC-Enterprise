@@ -163,6 +163,14 @@ export async function closeCapa(user:string,org:string,capaId:string,input:any){
   const out=(await client.query(`UPDATE grc_capa SET status='CLOSED',approved_by=$2,closed_at=now(),updated_at=now() WHERE id=$1 AND status='VALIDATION' RETURNING *`,[capaId,user])).rows[0];
   if(!out)throw Object.assign(new Error('CAPA state changed before closure'),{statusCode:409});
   await client.query(`UPDATE grc_issues SET status='CLOSED',closed_by=$2,closed_at=now(),updated_at=now() WHERE id=$1`,[c.issue_id,user]);
+  // Lifecycle: the independently reviewed closure becomes control evidence on the affected scoped control.
+  const issueRow=(await client.query('SELECT scope_control_id,finding_id,assessment_id FROM grc_issues WHERE id=$1',[c.issue_id])).rows[0];
+  if(issueRow?.scope_control_id){
+   const retestEv=c.finding_retest_id?(await client.query('SELECT fr.evidence_id,e.sha256 FROM finding_retests fr LEFT JOIN evidence e ON e.id=fr.evidence_id WHERE fr.id=$1',[c.finding_retest_id])).rows[0]:null;
+   const ref={type:c.finding_retest_id?'CAPA_CLOSURE_FINDING_RETEST':'CAPA_CLOSURE_CONTROL_TEST',capaId,issueId:c.issue_id,findingId:issueRow.finding_id||null,assessmentId:issueRow.assessment_id||null,findingRetestId:c.finding_retest_id||null,controlTestRunId:c.retest_run_id||null,evidenceId:retestEv?.evidence_id||null,evidenceSha256:retestEv?.sha256||null,independentReviewer:user,closedAt:new Date().toISOString()};
+   await client.query(`UPDATE grc_scope_controls SET evidence_refs=evidence_refs||jsonb_build_array($2::jsonb),updated_at=now() WHERE id=$1`,[issueRow.scope_control_id,ref]);
+   await event(org,'CAPA',capaId,'CONTROL_EVIDENCE_LINKED',user,undefined,{scopeControlId:issueRow.scope_control_id,...ref},client);
+  }
   await event(org,'CAPA',capaId,'CLOSED',user,String(input.reason||''),{retestRunId:c.retest_run_id,findingRetestId:c.finding_retest_id,validationSource:c.finding_retest_id?'TARGETED_FINDING_RETEST':'CONTROL_TEST'},client);
   await client.query('COMMIT');return out;
  }catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}

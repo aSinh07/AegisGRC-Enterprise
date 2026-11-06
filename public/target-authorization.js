@@ -7,7 +7,8 @@
  const $=id=>document.getElementById(id);
  async function call(url,opt){const r=await fetch(url,Object.assign({credentials:'same-origin',headers:{'Content-Type':'application/json'}},opt||{}));let d={};try{d=await r.json()}catch{}if(!r.ok&&r.status!==409)throw new Error(d.error||('HTTP '+r.status));return {status:r.status,data:d}}
  function el(tag,attrs,text){const e=document.createElement(tag);for(const [k,v] of Object.entries(attrs||{}))e.setAttribute(k,v);if(text!=null)e.textContent=String(text);return e}
- function orgId(){return ctx.orgId||globalThis.activeGrcOrg||''}
+ // activeGrcOrg is a top-level `let` in dashboard.js: shared by name between classic scripts, not on globalThis.
+ function orgId(){return ctx.orgId||(typeof activeGrcOrg!=='undefined'&&activeGrcOrg)||''}
 
  function ensurePanel(){
   let p=$('targetAuthPanel');if(p)return p;
