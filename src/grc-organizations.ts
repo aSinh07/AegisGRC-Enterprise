@@ -4,17 +4,23 @@ import pg from 'pg';
 
 
 
-export type OrgRole='ORG_ADMIN'|'GRC_MANAGER'|'GRC_CONSULTANT'|'GRC_ANALYST'|'CONTROL_OWNER'|'RISK_OWNER'|'REVIEWER'|'AUDITOR'|'VIEWER';
-const roles:OrgRole[]=['ORG_ADMIN','GRC_MANAGER','GRC_CONSULTANT','GRC_ANALYST','CONTROL_OWNER','RISK_OWNER','REVIEWER','AUDITOR','VIEWER'];
+export type OrgRole='ORG_ADMIN'|'GRC_MANAGER'|'GRC_CONSULTANT'|'GRC_ANALYST'|'SECURITY_ANALYST'|'DEVELOPER'|'CONTROL_OWNER'|'RISK_OWNER'|'REVIEWER'|'AUDITOR'|'VIEWER';
+const roles:OrgRole[]=['ORG_ADMIN','GRC_MANAGER','GRC_CONSULTANT','GRC_ANALYST','SECURITY_ANALYST','DEVELOPER','CONTROL_OWNER','RISK_OWNER','REVIEWER','AUDITOR','VIEWER'];
 const permissions={
  read:new Set<OrgRole>(roles),
  manageOrg:new Set<OrgRole>(['ORG_ADMIN']),
  manageScope:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST']),
  manageControl:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST','CONTROL_OWNER']),
  manageRisk:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST','RISK_OWNER']),
- manageAssessment:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST']),
+ // SECURITY_ANALYST runs authorized scans and triages findings without GRC administration rights.
+ manageAssessment:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST','SECURITY_ANALYST']),
  initiateAudit:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER','AUDITOR']),
- findingReview:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST','REVIEWER']),
+ findingReview:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST','SECURITY_ANALYST','REVIEWER']),
+ // Retest collects fresh evidence for an existing finding. DEVELOPER can prove a fix this way but
+ // cannot close the finding (findingReview), start new assessments or change GRC records.
+ retest:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST','SECURITY_ANALYST','DEVELOPER']),
+ // Approving a verified scan target is separate from requesting it (see target-authorization.ts).
+ approveTarget:new Set<OrgRole>(['ORG_ADMIN','GRC_MANAGER']),
  review:new Set<OrgRole>(['GRC_MANAGER','GRC_CONSULTANT','REVIEWER','AUDITOR'])
 };
 export type OrgPermission=keyof typeof permissions;
@@ -33,13 +39,13 @@ export async function initOrganizations(){
  CREATE TABLE IF NOT EXISTS grc_organization_members(
    organization_id uuid NOT NULL REFERENCES grc_organizations(id) ON DELETE CASCADE,
    user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
-   role text NOT NULL CHECK(role IN ('ORG_ADMIN','GRC_MANAGER','GRC_CONSULTANT','GRC_ANALYST','CONTROL_OWNER','RISK_OWNER','REVIEWER','AUDITOR','VIEWER')),
+   role text NOT NULL CHECK(role IN ('ORG_ADMIN','GRC_MANAGER','GRC_CONSULTANT','GRC_ANALYST','SECURITY_ANALYST','DEVELOPER','CONTROL_OWNER','RISK_OWNER','REVIEWER','AUDITOR','VIEWER')),
    status text NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','SUSPENDED')),
    created_at timestamptz NOT NULL DEFAULT now(),
    PRIMARY KEY(organization_id,user_id)
  );
  ALTER TABLE grc_organization_members DROP CONSTRAINT IF EXISTS grc_organization_members_role_check;
- ALTER TABLE grc_organization_members ADD CONSTRAINT grc_organization_members_role_check CHECK(role IN ('ORG_ADMIN','GRC_MANAGER','GRC_CONSULTANT','GRC_ANALYST','CONTROL_OWNER','RISK_OWNER','REVIEWER','AUDITOR','VIEWER'));
+ ALTER TABLE grc_organization_members ADD CONSTRAINT grc_organization_members_role_check CHECK(role IN ('ORG_ADMIN','GRC_MANAGER','GRC_CONSULTANT','GRC_ANALYST','SECURITY_ANALYST','DEVELOPER','CONTROL_OWNER','RISK_OWNER','REVIEWER','AUDITOR','VIEWER'));
  CREATE INDEX IF NOT EXISTS grc_org_members_user_idx ON grc_organization_members(user_id,status);
  CREATE TABLE IF NOT EXISTS grc_scopes(
    id uuid PRIMARY KEY,organization_id uuid NOT NULL REFERENCES grc_organizations(id) ON DELETE CASCADE,

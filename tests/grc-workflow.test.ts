@@ -94,7 +94,7 @@ test('CAPA closure validates retest and reviewer independence under transaction 
 
 test('assessment mutations require an explicit mutation role',async()=>{
  const orgs=await readFile(new URL('../src/grc-organizations.ts',import.meta.url),'utf8');
- assert.match(orgs,/manageAssessment:new Set<OrgRole>\(\['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST'\]\)/);
+ assert.match(orgs,/manageAssessment:new Set<OrgRole>\(\['ORG_ADMIN','GRC_MANAGER','GRC_ANALYST','SECURITY_ANALYST'\]\)/);
  const server=await readFile(new URL('../src/server.ts',import.meta.url),'utf8');
  for(const route of ["app.post('/api/scans/quick'","app.post('/api/scans/run'","app.post('/api/assessments/:id/documents'","app.post('/api/assessments/:id/documents/:docId/security-assess'","app.post('/api/assessments/:id/documents/:docId/analyze'"]){
   const start=server.indexOf(route);assert.ok(start>=0,route+' missing');const next=server.indexOf('app.',start+10);const body=server.slice(start,next<0?start+5000:next);assert.match(body,/requireOrgPermission\(u\.userId,access\.organization_id,'manageAssessment'\)/,route);

@@ -152,3 +152,42 @@ test('nuclei templates are pinned by release and commit, read-only, and never au
  await writeFile(dir+'/.aegis-pin','v10.5.1 79fb682760ab3d5b0e22afbb44709353cbebf023\n');
  assert.deepEqual(nucleiTemplatesPin(dir),{version:'v10.5.1',commit:'79fb682760ab3d5b0e22afbb44709353cbebf023'});
 });
+
+// ── Gap: no Security Analyst or Developer roles ─────────────────────────────
+import {roleAllows} from '../src/grc-organizations.js';
+test('SECURITY_ANALYST scans and triages; DEVELOPER can only read and retest',()=>{
+ assert.equal(roleAllows('SECURITY_ANALYST','manageAssessment'),true);
+ assert.equal(roleAllows('SECURITY_ANALYST','findingReview'),true);
+ assert.equal(roleAllows('SECURITY_ANALYST','retest'),true);
+ assert.equal(roleAllows('SECURITY_ANALYST','manageOrg'),false);
+ assert.equal(roleAllows('SECURITY_ANALYST','manageControl'),false);
+ assert.equal(roleAllows('SECURITY_ANALYST','approveTarget'),false);
+ assert.equal(roleAllows('DEVELOPER','retest'),true);
+ assert.equal(roleAllows('DEVELOPER','read'),true);
+ for(const p of ['manageAssessment','findingReview','manageRisk','manageControl','manageScope','manageOrg','approveTarget','review'] as const)assert.equal(roleAllows('DEVELOPER',p),false,p);
+ assert.equal(roleAllows('GRC_ANALYST','retest'),true);assert.equal(roleAllows('VIEWER','retest'),false);
+});
+test('every finding retest endpoint requires the retest permission, not assessment management',async()=>{
+ const server=await readFile(new URL('../src/server.ts',import.meta.url),'utf8');
+ const handlers=server.split(/\napp\./).filter(h=>/^post\('[^']*retest'/.test(h)&&!h.startsWith("post('/api/grc/organizations/:orgId/capa"));
+ assert.equal(handlers.length,7);
+ for(const h of handlers){assert.match(h,/requireOrgPermission\(u\.userId,access\.organization_id,'retest'\)/,h.slice(0,90));assert.doesNotMatch(h.split('\napp.')[0].slice(0,1500),/'manageAssessment'/,h.slice(0,90))}
+ const orgs=await readFile(new URL('../src/grc-organizations.ts',import.meta.url),'utf8');
+ assert.equal((orgs.match(/'SECURITY_ANALYST','DEVELOPER','CONTROL_OWNER'/g)||[]).length,3,'role type, list and DB CHECK constraints include the new roles');
+});
+test('DEVELOPER membership is accepted by the database and limited by permission checks',{skip:!ciDb},async()=>{
+ const {initOrganizations,createOrganization,addMember,requireOrgPermission}=await import('../src/grc-organizations.js');
+ const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:false});
+ try{
+  await initOrganizations();
+  const mk=async()=>{const id=crypto.randomUUID();await pool.query("INSERT INTO app_users(id,email,password_hash,password_salt,totp_secret) VALUES($1,$2,'x','x','x')",[id,id+'@t.example']);return id};
+  const admin=await mk(),dev=await mk(),sec=await mk();
+  const org:any=await createOrganization(admin,{name:'Role test '+admin.slice(0,8)});const orgId=org.id||org.organization?.id;
+  await addMember(admin,orgId,dev,'DEVELOPER');await addMember(admin,orgId,sec,'SECURITY_ANALYST');
+  await requireOrgPermission(dev,orgId,'retest');
+  await assert.rejects(requireOrgPermission(dev,orgId,'manageAssessment'),/Insufficient organization role/);
+  await assert.rejects(requireOrgPermission(dev,orgId,'findingReview'),/Insufficient organization role/);
+  await requireOrgPermission(sec,orgId,'manageAssessment');await requireOrgPermission(sec,orgId,'findingReview');
+  await assert.rejects(requireOrgPermission(sec,orgId,'manageOrg'),/Insufficient organization role/);
+ }finally{await pool.end()}
+});
