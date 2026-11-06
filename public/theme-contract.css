@@ -60,3 +60,19 @@ html[data-theme="light"] .side .nav button{color:#b9c9da!important}html[data-the
 .lc-NOT_APPLICABLE{border-left-color:#64748b;opacity:.75}
 .lc-step .chip{justify-self:start}
 #lcMsg:empty{display:none}
+
+/* Compliance & SoA panel (public/compliance.js) */
+.cp-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:10px}
+.cp-stat{border:1px solid var(--line);border-left-width:4px;border-radius:8px;padding:8px 10px;display:grid}
+.cp-stat strong{font-size:1.4em}
+.cp-bars{display:grid;gap:6px;margin-bottom:8px}
+.cp-bar{display:grid;grid-template-columns:minmax(120px,170px) minmax(80px,1fr) auto;gap:8px;align-items:center}
+.cp-bar meter{width:100%}
+.cp-scroll{overflow-x:auto;max-width:100%}
+.cp-table{border-collapse:collapse;width:100%;min-width:760px;font-size:.88em}
+.cp-table th,.cp-table td{border:1px solid var(--line);padding:6px;vertical-align:top;text-align:left}
+.cp-table td.lc-DONE{border-left:4px solid #16a34a}.cp-table td.lc-BLOCKED{border-left:4px solid #dc2626}
+.cp-days{width:5em}
+@media (max-width:560px){.cp-bar{grid-template-columns:1fr}}
+#cpMsg:empty{display:none}
+.cp-stat.lc-DONE{border-left-color:#16a34a}.cp-stat.lc-WARNING{border-left-color:#d97706}.cp-stat.lc-BLOCKED{border-left-color:#dc2626}

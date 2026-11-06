@@ -97,6 +97,10 @@ import {runScanTask,type RawScanResult} from './scan-runner.js';
 import {SCAN_PROFILES,enqueueUrlScanJob,decideUrlScanJob,listUrlScanJobs,pendingScanApprovals,claimUrlScanTask,heartbeatUrlScanTask,completeUrlScanTask,recoverExpiredScanLeases,activeScanAssessmentIds} from './url-scan-jobs.js';
 import {installScanJobPersistence} from './scan-job-persistence.js';
 import {assessmentLifecycle,phaseOneGate} from './lifecycle.js';
+import {initIsoLibrary} from './iso-library.js';
+import {initGovernanceDepth,revisePolicy,policyVersionHistory,linkAsset,assetProfile,complianceDashboard,soaXlsx,soaPdf} from './governance-depth.js';
+import {soaWithGates} from './soa-gates.js';
+import {createScanSchedule,listScanSchedules,setScanScheduleEnabled,listNotifications,startScheduler} from './scheduler.js';
 import {parseWorkerKeys,verifyWorkerRequest,verifyScanOutput,rawOutputDigest} from './worker-protocol.js';
 import {runtimeManagesSchema,databaseRolePosture} from './schema-init.js';
 import {recordSignedReport,reportHeaders,verifyReportRecord,verifyReportBytes} from './report-records.js';
@@ -121,6 +125,7 @@ await initGrcIntake();
 await initOrganizations();
 await initControlRegistry();
 await initBuiltInFrameworkLibrary();
+await initIsoLibrary();
 await initGovernancePerformance();
 await initThirdPartyRisk();await initTprmWorkflow();await initAutomationOutbox();
 await initPrivacyOperations();
@@ -145,6 +150,7 @@ await initOperationalSecurity();
 await initSecurityReportHandoffs();
 await initSecurityFindingProposals();
 await initScannerJobs();
+await initGovernanceDepth();
 }
 if(process.env.DATABASE_URL){const posture=await databaseRolePosture();if(!posture.hardened){const msg='[AEGIS DB] runtime role '+posture.role+' is '+(posture.superuser?'a superuser':posture.ownsSchema?'the schema owner':'allowed to create objects')+'; database triggers are not a hard control for this role';if(String(process.env.AEGIS_REQUIRE_NON_OWNER_DB_ROLE||'').toLowerCase()==='true')throw new Error(msg);console.warn(msg)}}
 await recoverStaleScannerJobs();
@@ -680,6 +686,28 @@ app.post('/api/grc/organizations/:orgId/target-authorizations/:id/revoke',async(
 installScanJobPersistence();
 app.get('/api/grc/assessments/:assessmentId/lifecycle',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await assessmentLifecycle(u.userId,req.params.assessmentId))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.get('/api/grc/organizations/:orgId/lifecycle-gate',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await phaseOneGate(u.userId,req.params.orgId))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+// ── Phase 2: GRC depth ─────────────────────────────────────────────────────
+const P2=(fn:(u:any,req:any)=>Promise<any>,status=200)=>async(req:any,res:any)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.status(status).json(await fn(u,req))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}};
+app.get('/api/grc/organizations/:orgId/scopes/:scopeId/soa-gates',P2((u,req)=>soaWithGates(u.userId,req.params.orgId,req.params.scopeId)));
+app.get('/api/grc/organizations/:orgId/scopes/:scopeId/soa-gates.:format',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});
+ const soa=await soaWithGates(u.userId,req.params.orgId,req.params.scopeId),format=String(req.params.format).toLowerCase();
+ let body:Buffer,contentType:string;
+ if(format==='pdf'){body=await soaPdf(soa);contentType='application/pdf'}else if(format==='xlsx'){body=soaXlsx(soa);contentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}else if(format==='json'){body=Buffer.from(JSON.stringify(soa,null,2));contentType='application/json'}else return res.status(400).json({error:'Format must be pdf, xlsx or json'});
+ const filename='AegisGRC-SoA-'+req.params.scopeId+'.'+format;
+ // Every SoA export (all formats) is stored and signed: it is the Phase 2 gate artefact.
+ if(db.mode()==='postgres'){const rec=await recordSignedReport({organizationId:req.params.orgId,scopeRef:req.params.scopeId,reportType:'SOA',format,filename,contentType,body,actor:u.userId});for(const [k,v] of Object.entries(reportHeaders(rec)))res.setHeader(k,v)}
+ res.setHeader('Content-Type',contentType);res.setHeader('Content-Disposition','attachment; filename="'+filename+'"');res.send(body)}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.get('/api/grc/organizations/:orgId/phase-two-gate',P2(async(u,req)=>{await requireOrgPermission(u.userId,req.params.orgId,'read');const r=(await dbPool.query(`SELECT id,scope_ref,format,generated_at FROM report_records WHERE organization_id=$1 AND report_type='SOA' AND hmac_sha256 IS NOT NULL ORDER BY generated_at DESC LIMIT 1`,[req.params.orgId])).rows[0];return {gate:'PHASE_2_GRC_DEPTH',passed:Boolean(r),requirement:'An SoA export showing all five control gates, stored and signed.',latestSignedSoa:r||null}}));
+app.get('/api/grc/organizations/:orgId/compliance-dashboard',P2((u,req)=>complianceDashboard(u.userId,req.params.orgId)));
+app.post('/api/grc/organizations/:orgId/policies/:policyId/revise',P2((u,req)=>revisePolicy(u.userId,req.params.orgId,req.params.policyId,req.body||{}),201));
+app.get('/api/grc/organizations/:orgId/policies/:policyId/versions',P2((u,req)=>policyVersionHistory(u.userId,req.params.orgId,req.params.policyId)));
+app.post('/api/grc/organizations/:orgId/assets/:assetId/links',P2((u,req)=>linkAsset(u.userId,req.params.orgId,req.params.assetId,req.body||{}),201));
+app.get('/api/grc/organizations/:orgId/assets/:assetId/profile',P2((u,req)=>assetProfile(u.userId,req.params.orgId,req.params.assetId)));
+app.post('/api/assessments/:id/scan-schedules',P2((u,req)=>createScanSchedule(u.userId,req.params.id,req.body||{}),201));
+app.get('/api/grc/organizations/:orgId/scan-schedules',P2((u,req)=>listScanSchedules(u.userId,req.params.orgId)));
+app.post('/api/grc/organizations/:orgId/scan-schedules/:id/enabled',P2((u,req)=>setScanScheduleEnabled(u.userId,req.params.orgId,req.params.id,req.body?.enabled===true)));
+app.get('/api/grc/organizations/:orgId/notifications',P2((u,req)=>listNotifications(u.userId,req.params.orgId,String(req.query.mine||'')==='1')));
+if(process.env.DATABASE_URL&&String(process.env.SCHEDULER_ENABLED||'true')!=='false')startScheduler();
 app.get('/api/scan-profiles',(_req,res)=>res.json({profiles:Object.entries(SCAN_PROFILES).map(([id,p])=>({id,tools:p.tasks.map(t=>t.tool+(t.options?.zapMode?':'+t.options.zapMode:'')),requiresApproval:p.requiresApproval,description:p.description}))}));
 app.post('/api/assessments/:id/scan-jobs',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.status(202).json(await enqueueUrlScanJob(u.userId,req.params.id,{profile:String(req.body?.profile||'STANDARD')}))}catch(e:any){res.status(e.statusCode||400).json({error:e.message,code:e.code})}});
 app.get('/api/assessments/:id/scan-jobs',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json({jobs:await listUrlScanJobs(u.userId,req.params.id)})}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});

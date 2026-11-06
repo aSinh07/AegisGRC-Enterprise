@@ -1,4 +1,6 @@
 import {pool} from './db-pool.js';
+import {initIsoLibrary} from './iso-library.js';
+import {initGovernanceDepth} from './governance-depth.js';
 import {initUsers} from './user-auth.js';
 import {initGrcReviews} from './grc-review.js';
 import {initGrcCore} from './grc-core.js';
@@ -38,7 +40,7 @@ import {initScannerJobs} from './scanner-jobs.js';
 // when its own database role owns the schema (legacy single-role deployments). With a
 // separate non-owner runtime role, the server performs no DDL at all.
 // tests/open-gap-closure.test.ts asserts this list matches the block in src/server.ts.
-export const RUNTIME_SCHEMA_INITIALIZERS=['initUsers','initGrcReviews','initGrcCore','initGrcIntake','initOrganizations','initControlRegistry','initBuiltInFrameworkLibrary','initGovernancePerformance','initThirdPartyRisk','initTprmWorkflow','initAutomationOutbox','initPrivacyOperations','initArchitectureAssurance','initArchitectureModels','initContinuousCompliance','initBusinessContinuity','initPolicyGovernance','initKnowledgeSources','initAuditManagement','initEvidenceEngine','initIssueRiskCapa','initGrcOperations','initGrcAutomation','initFindingReview','initFindingRisk','initFindingPromotion','initAssessmentInventory','initBreachAssessment','initIncidentResponse','initOperationalSecurity','initSecurityReportHandoffs','initSecurityFindingProposals','initScannerJobs'] as const;
+export const RUNTIME_SCHEMA_INITIALIZERS=['initUsers','initGrcReviews','initGrcCore','initGrcIntake','initOrganizations','initControlRegistry','initBuiltInFrameworkLibrary','initIsoLibrary','initGovernancePerformance','initThirdPartyRisk','initTprmWorkflow','initAutomationOutbox','initPrivacyOperations','initArchitectureAssurance','initArchitectureModels','initContinuousCompliance','initBusinessContinuity','initPolicyGovernance','initKnowledgeSources','initAuditManagement','initEvidenceEngine','initIssueRiskCapa','initGrcOperations','initGrcAutomation','initFindingReview','initFindingRisk','initFindingPromotion','initAssessmentInventory','initBreachAssessment','initIncidentResponse','initOperationalSecurity','initSecurityReportHandoffs','initSecurityFindingProposals','initScannerJobs','initGovernanceDepth'] as const;
 export async function initRuntimeSchema(){
  await initUsers();
  await initGrcReviews();
@@ -47,6 +49,7 @@ export async function initRuntimeSchema(){
  await initOrganizations();
  await initControlRegistry();
  await initBuiltInFrameworkLibrary();
+ await initIsoLibrary();
  await initGovernancePerformance();
  await initThirdPartyRisk();
  await initTprmWorkflow();
@@ -73,6 +76,7 @@ export async function initRuntimeSchema(){
  await initSecurityReportHandoffs();
  await initSecurityFindingProposals();
  await initScannerJobs();
+ await initGovernanceDepth();
 }
 
 /** True when the connected role owns the AegisGRC schema (or the schema does not exist yet). */

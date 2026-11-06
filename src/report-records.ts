@@ -10,7 +10,7 @@ import {requireOrgPermission} from './grc-organizations.js';
 // record id, digest and signature in response headers, and anyone in the organization
 // can later prove that a PDF they hold was issued by AegisGRC and was not altered.
 
-export type ReportType='OFFENSIVE'|'DEFENSIVE'|'ENTERPRISE_GRC'|'COMBINED_ASSURANCE'|'AUDIT_PACKAGE'|'AUDIT_READINESS'|'ASSESSMENT_REPORT';
+export type ReportType='OFFENSIVE'|'DEFENSIVE'|'ENTERPRISE_GRC'|'COMBINED_ASSURANCE'|'AUDIT_PACKAGE'|'AUDIT_READINESS'|'ASSESSMENT_REPORT'|'SOA';
 const SIG_VERSION='AEGISGRC_REPORT_RECORD_V1';
 const PLACEHOLDER=/change-me|replace-with|REPLACE_WITH/i;
 
