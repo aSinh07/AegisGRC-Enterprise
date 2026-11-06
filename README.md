@@ -19,7 +19,7 @@ Production-oriented GRC and authorized security-assessment platform.
 - Docker runtime and GitHub Actions build verification.
 
 ## Safety / authorization
-Use only on systems you own or have explicit permission to assess. Private, loopback, link-local, multicast and reserved destinations are blocked by default. Redirects and resolved addresses must remain in the authorized scope.
+Use only on systems you own or have explicit permission to assess. In production, a target must pass DNS/HTTP ownership verification and be approved by a second authorized user before any scan (see `docs/ARCHITECTURE_GAP_CLOSURE.md`). Scanners connect only to the validated, pinned address. Private, loopback, link-local, multicast and reserved destinations are blocked by default. Redirects and resolved addresses must remain in the authorized scope.
 
 ## Local development
 ```bash
@@ -42,4 +42,6 @@ Set `DATABASE_URL` to enable PostgreSQL. The container runs the idempotent schem
 `docker-compose.production.yml` and `scripts/deploy-gce.sh` are the supported production path for the Google Cloud Compute Engine VM. Create `.env.production` from `.env.production.example`, use strong server-side secrets, and preserve the named `aegis-db` PostgreSQL volume. The deployment script rebuilds the application container without deleting the database volume and verifies `/api/ready` before declaring the release healthy.
 
 ## Data trust model
+Evidence is HMAC-signed, the audit trail is hash-chained with signed checkpoints, and every governed PDF is stored as a signed report record. The app runs as a non-owner database role, so the append-only triggers are a hard control.
+
 Scanner stdout/stderr is evidence. Parsed findings reference its SHA-256. Deterministic framework mappings and optional AI remediation are downstream interpretations and never replace raw evidence.
