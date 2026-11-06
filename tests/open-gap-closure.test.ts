@@ -250,3 +250,26 @@ test('assessment authorization and every active URL scan consult the target auth
  const ui=await readFile(new URL('../public/target-authorization.js',import.meta.url),'utf8');
  assert.doesNotMatch(ui,/innerHTML/);assert.match(ui,/globalThis\.openTargetAuthorizations=/);
 });
+
+// ── Gap: HTTP-posture and sqlmap findings have no deterministic retest ──────
+import {findingFingerprint} from '../src/finding-correlation.js';
+import {sqlmapTextFindings} from '../src/infrastructure-parsers.js';
+test('sqlmap and HTTP-posture findings have stable fingerprints across independent runs',()=>{
+ const raw='Parameter: id (GET)\n    Type: boolean-based blind\n    Title: AND boolean-based blind\n    Payload: id=1 AND 1=1\n';
+ const a=sqlmapTextFindings('a1','https://example.com','e1',raw)[0],b=sqlmapTextFindings('a1','https://example.com','e2',raw)[0];
+ assert.ok(a&&b);assert.notEqual(a.id,b.id);assert.equal(findingFingerprint(a),findingFingerprint(b));
+ const other=sqlmapTextFindings('a1','https://example.com','e3',raw.replace('id (GET)','q (GET)'))[0];assert.notEqual(findingFingerprint(a),findingFingerprint(other));
+ const posture=(desc:string)=>({id:crypto.randomUUID(),assessmentId:'a',source:'http' as const,title:'Server technology disclosed',description:desc,severity:'LOW' as const,asset:'https://example.com',evidenceHash:'x',createdAt:'',mappings:{}});
+ assert.equal(findingFingerprint(posture('Server: nginx/1.1')),findingFingerprint(posture('Server: nginx/1.2')),'description changes do not break the fingerprint');
+});
+test('targeted retest supports http and sqlmap, and a failed posture probe can never close a finding',async()=>{
+ const server=await readFile(new URL('../src/server.ts',import.meta.url),'utf8');
+ assert.match(server,/const NATIVE_RETEST_SOURCES=\['nmap','wapiti','zap','nuclei','sqlmap','http'\]/);
+ assert.match(server,/original\.source==='http'\?await retestHttpPosture\(/);
+ assert.match(server,/const exitCode=q\.error\|\|!q\.status\?1:0;/);
+ assert.match(server,/const findings=exitCode===0\?q\.findings:\[\]/);
+ const {retestEvidenceIsComplete}=await import('../src/finding-review.js');
+ assert.equal(retestEvidenceIsComplete({exitCode:1,metadata:{mode:'live-http-posture'}}),false);
+ const ui=await readFile(new URL('../public/dashboard.js',import.meta.url),'utf8');
+ assert.match(ui,/\['nmap','wapiti','zap','nuclei','sqlmap','http'\]\.includes/);
+});

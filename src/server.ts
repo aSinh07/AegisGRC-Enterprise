@@ -754,6 +754,21 @@ app.post('/api/grc/assessments/:assessmentId/findings/:findingId/openvas-retest'
  await db.saveFindingRetest({id:crypto.randomUUID(),findingId:original.id,assessmentId:req.params.assessmentId,evidenceId:ev.id,fingerprint,scannerSource:'openvas',scannerId:original.externalIds?.scannerId||null,createdBy:u.userId},audit);
  res.status(stillPresent?409:200).json({execution:'IMPORTED_OPENVAS_TARGETED_RETEST',findingId:original.id,fingerprint,evidenceId:ev.id,evidence:{sha256},stillPresent,findings});
 }catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+// Sources with a deterministic, server-side targeted retest. 'http' re-runs the pinned HTTP posture
+// probe and 'sqlmap' re-runs the fixed sqlmap profile against the same authorized URL. Both keep the
+// finding fingerprint stable (fixed titles; sqlmap scannerId = 'sqlmap:<parameter>').
+const NATIVE_RETEST_SOURCES=['nmap','wapiti','zap','nuclei','sqlmap','http'];
+async function retestHttpPosture(assessmentId:string,t:{url:URL,addresses:string[]},actor:string){
+ await assertTargetAuthorized(await assessmentOrganizationId(assessmentId),t.url.hostname);
+ const q=await quickPosture(assessmentId,t);
+ // A failed probe (no HTTP status) is incomplete evidence: exit code 1 means it can never close a finding.
+ const exitCode=q.error||!q.status?1:0;
+ const ev:Evidence={id:crypto.randomUUID(),assessmentId,source:'http',sha256:q.sha256,createdAt:q.completedAt,exitCode,stdout:JSON.stringify({status:q.status,headers:q.headers}),stderr:q.error,metadata:{target:t.url.origin,durationMs:q.durationMs,mode:'live-http-posture',retest:true,egress:{mode:'PINNED_LOOKUP',pinnedAddress:pinnedAddress(t.addresses),hostname:t.url.hostname}}};
+ await db.saveEvidence(ev);
+ const findings=exitCode===0?q.findings:[];if(findings.length)await db.saveFindings(findings);
+ await db.saveAudit({id:crypto.randomUUID(),assessmentId,action:'REAL_SCAN_COMPLETED',actor,createdAt:q.completedAt,metadata:{tool:'http',exitCode,evidenceHash:q.sha256,durationMs:q.durationMs,findingCount:findings.length,retest:true}});
+ return {tool:'http',exitCode,evidence:{sha256:q.sha256},findings};
+}
 app.post('/api/findings/:findingId/retest',async(req,res)=>{try{
  // A scan-session token (issued at authorization) is optional: retest-only roles such as DEVELOPER
  // never receive one, so the assessment's own authorized target is used as the scope instead.
@@ -765,10 +780,10 @@ app.post('/api/findings/:findingId/retest',async(req,res)=>{try{
  const authorizedOrigin=session?session.targetOrigin:assessment.target;
  const access=await requireAssessmentAccess(u.userId,assessmentId);await requireOrgPermission(u.userId,access.organization_id,'retest');
  const original=(await db.findingsForAssessment(assessmentId)).find(x=>x.id===req.params.findingId);if(!original)return res.status(404).json({error:'Finding not found'});
- if(!['nmap','wapiti','zap','nuclei'].includes(original.source))return res.status(409).json({error:'This finding source does not yet support deterministic server-side retest'});
+ if(!NATIVE_RETEST_SOURCES.includes(original.source))return res.status(409).json({error:'This finding source does not yet support deterministic server-side retest'});
  const fingerprint=original.fingerprint||findingFingerprint(original);
  const t=await validateTarget(assessment.target);if(t.url.origin!==authorizedOrigin)return res.status(403).json({error:'Assessment target is outside the authorized session scope'});
- const rr:any=await executeRealTool(original.source as 'nmap'|'wapiti'|'zap'|'nuclei',assessmentId,t,u.userId);
+ const rr:any=original.source==='http'?await retestHttpPosture(assessmentId,t,u.userId):await executeRealTool(original.source as 'nmap'|'wapiti'|'zap'|'nuclei'|'sqlmap',assessmentId,t,u.userId);
  const records=await db.evidenceForAssessment(assessmentId),ev=records.find(x=>x.sha256===rr.evidence.sha256);
  if(!ev)throw new Error('Retest evidence persistence failed');
  const stillPresent=Array.isArray(rr.findings)&&rr.findings.some((x:Finding)=>(x.fingerprint||findingFingerprint(x))===fingerprint);
