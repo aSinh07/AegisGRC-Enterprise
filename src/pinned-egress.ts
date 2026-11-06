@@ -83,11 +83,18 @@ export async function withPinnedEgress<T>(t:PinnedTarget,fn:(proxy:{proxyUrl:str
 }
 
 /** Single GET to the authorized origin over the pinned address (no redirects followed). */
-export async function pinnedHttpGet(t:PinnedTarget,timeoutMs:number,headers:Record<string,string>={}){
+export async function pinnedHttpGet(t:PinnedTarget,timeoutMs:number,headers:Record<string,string>={},opts:{path?:string;maxBodyBytes?:number}={}){
  const https=await import('node:https');
  const lib=t.url.protocol==='https:'?https:http;
- return new Promise<{status:number;headers:Record<string,string|string[]|undefined>}>((resolve,reject)=>{
-  const req=lib.request({protocol:t.url.protocol,hostname:t.url.hostname,port:Number(t.url.port)||undefined,path:'/',method:'GET',headers,lookup:pinnedLookup(t),servername:t.url.hostname,timeout:timeoutMs},res=>{res.resume();resolve({status:res.statusCode||0,headers:res.headers})});
+ const path=opts.path||'/',max=Math.max(0,opts.maxBodyBytes||0);
+ return new Promise<{status:number;headers:Record<string,string|string[]|undefined>;body:string}>((resolve,reject)=>{
+  const req=lib.request({protocol:t.url.protocol,hostname:t.url.hostname,port:Number(t.url.port)||undefined,path,method:'GET',headers,lookup:pinnedLookup(t),servername:t.url.hostname,timeout:timeoutMs},res=>{
+   if(!max){res.resume();resolve({status:res.statusCode||0,headers:res.headers,body:''});return}
+   const chunks:Buffer[]=[];let n=0;
+   res.on('data',(d:Buffer)=>{if(n<max){chunks.push(d.subarray(0,max-n));n+=d.length}if(n>=max)res.destroy()});
+   const done=()=>resolve({status:res.statusCode||0,headers:res.headers,body:Buffer.concat(chunks).toString('utf8')});
+   res.on('end',done);res.on('close',done);
+  });
   req.on('timeout',()=>req.destroy(Object.assign(new Error('HTTP posture probe exceeded '+(timeoutMs/1000)+'s'),{name:'AbortError'})));
   req.on('error',reject);req.end();
  });

@@ -196,3 +196,28 @@ DROP TRIGGER IF EXISTS audit_chain_checkpoints_append_only ON audit_chain_checkp
 CREATE TRIGGER audit_chain_checkpoints_append_only BEFORE UPDATE OR DELETE ON audit_chain_checkpoints FOR EACH ROW EXECUTE FUNCTION aegis_forbid_evidence_mutation();
 DROP TRIGGER IF EXISTS audit_chain_checkpoints_no_truncate ON audit_chain_checkpoints;
 CREATE TRIGGER audit_chain_checkpoints_no_truncate BEFORE TRUNCATE ON audit_chain_checkpoints FOR EACH STATEMENT EXECUTE FUNCTION aegis_forbid_evidence_mutation();
+
+-- Target authorization: proof of hostname control (DNS TXT or /.well-known file) plus a
+-- second-person approval. The CHECK enforces separation of duties in the database itself.
+CREATE TABLE IF NOT EXISTS target_authorizations(
+ id uuid PRIMARY KEY,
+ organization_id uuid NOT NULL REFERENCES grc_organizations(id) ON DELETE RESTRICT,
+ hostname text NOT NULL,
+ origin text NOT NULL,
+ method text NOT NULL CHECK(method IN ('DNS_TXT','HTTP_FILE')),
+ token text NOT NULL,
+ status text NOT NULL CHECK(status IN ('PENDING_VERIFICATION','VERIFIED','APPROVED','REJECTED','REVOKED')),
+ requested_by uuid NOT NULL REFERENCES app_users(id) ON DELETE RESTRICT,
+ justification text,
+ verified_at timestamptz,
+ verification_evidence jsonb,
+ decided_by uuid REFERENCES app_users(id) ON DELETE RESTRICT,
+ decided_at timestamptz,
+ decision_note text,
+ expires_at timestamptz,
+ created_at timestamptz NOT NULL DEFAULT now(),
+ updated_at timestamptz NOT NULL DEFAULT now(),
+ CONSTRAINT target_authorizations_separation_of_duties CHECK(decided_by IS NULL OR decided_by<>requested_by),
+ CONSTRAINT target_authorizations_approval_complete CHECK(status<>'APPROVED' OR (decided_by IS NOT NULL AND verified_at IS NOT NULL AND expires_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS target_authorizations_lookup_idx ON target_authorizations(organization_id,hostname,status,expires_at);

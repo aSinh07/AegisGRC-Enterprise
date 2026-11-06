@@ -191,3 +191,62 @@ test('DEVELOPER membership is accepted by the database and limited by permission
   await assert.rejects(requireOrgPermission(sec,orgId,'manageOrg'),/Insufficient organization role/);
  }finally{await pool.end()}
 });
+
+// ── Gap: target authorization is a self-attested checkbox ───────────────────
+import {challengeMatches,challengeInstructions,targetAuthorizationMode} from '../src/target-authorization.js';
+test('ownership challenge matching is exact and instructions name the record or file',()=>{
+ assert.equal(challengeMatches(['aegis-verification=abc'],'abc'),true);
+ assert.equal(challengeMatches(['  aegis-verification=abc  '],'abc'),true);
+ assert.equal(challengeMatches(['aegis-verification=abcd','x aegis-verification=abc'],'abc'),false);
+ assert.equal(challengeMatches([],'abc'),false);
+ assert.deepEqual(challengeInstructions('DNS_TXT','app.example.com','https://app.example.com','t1'),{method:'DNS_TXT',recordType:'TXT',recordName:'_aegis-challenge.app.example.com',recordValue:'aegis-verification=t1',note:'Publish this TXT record, wait for DNS propagation, then run verification.'});
+ assert.equal((challengeInstructions('HTTP_FILE','app.example.com','https://app.example.com','t1') as any).url,'https://app.example.com/.well-known/aegis-verification.txt');
+ assert.equal(targetAuthorizationMode({NODE_ENV:'production'} as any),'enforce');
+ assert.equal(targetAuthorizationMode({NODE_ENV:'production',TARGET_AUTHORIZATION_MODE:'attest'} as any),'attest');
+ assert.equal(targetAuthorizationMode({NODE_ENV:'test'} as any),'attest');
+});
+test('target authorization needs verified ownership and a different approver, and gates scans',{skip:!ciDb},async()=>{
+ const ta=await import('../src/target-authorization.js');
+ const {createOrganization,addMember}=await import('../src/grc-organizations.js');
+ const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:false});
+ const prevMode=process.env.TARGET_AUTHORIZATION_MODE;process.env.TARGET_AUTHORIZATION_MODE='enforce';
+ try{
+  const mk=async()=>{const id=crypto.randomUUID();await pool.query("INSERT INTO app_users(id,email,password_hash,password_salt,totp_secret) VALUES($1,$2,'x','x','x')",[id,id+'@t.example']);return id};
+  const admin=await mk(),manager=await mk(),analyst=await mk();
+  const org:any=await createOrganization(admin,{name:'TA test '+admin.slice(0,8)});const orgId=org.id||org.organization?.id;
+  await addMember(admin,orgId,manager,'GRC_MANAGER');await addMember(admin,orgId,analyst,'SECURITY_ANALYST');
+  const host='scan-'+admin.slice(0,8)+'.example.com';
+  const fakeValidate=async(raw:string)=>({url:new URL(raw),addresses:['93.184.216.34']});
+  await assert.rejects(ta.assertTargetAuthorized(orgId,host),/No approved, unexpired target authorization/);
+  await assert.rejects(ta.requestTargetAuthorization(analyst,orgId,{targetUrl:'https://'+host,justification:'short'},fakeValidate),/Justification/);
+  const req=await ta.requestTargetAuthorization(analyst,orgId,{targetUrl:'https://'+host+'/login',method:'DNS_TXT',justification:'Pen test SOW-2026-114 signed by CISO'},fakeValidate);
+  assert.equal(req.status,'PENDING_VERIFICATION');assert.equal(req.challenge.recordName,'_aegis-challenge.'+host);assert.ok(!('token' in req),'token is only exposed through the challenge');
+  await assert.rejects(ta.decideTargetAuthorization(manager,orgId,req.id,{decision:'APPROVE'}),/Only ownership-VERIFIED/);
+  const miss=await ta.verifyTargetAuthorization(analyst,orgId,req.id,async()=>({observed:['aegis-verification=wrong'],evidence:{}}));
+  assert.equal(miss.verified,false);
+  const value=req.challenge.recordValue as string;
+  const hit=await ta.verifyTargetAuthorization(analyst,orgId,req.id,async()=>({observed:[value],evidence:{records:[value]}}));
+  assert.equal(hit.verified,true);
+  await assert.rejects(ta.decideTargetAuthorization(analyst,orgId,req.id,{decision:'APPROVE'}),/Insufficient organization role/,'analyst cannot approve');
+  // Requester with approval rights still cannot self-approve (app check + DB CHECK).
+  const self=await ta.requestTargetAuthorization(manager,orgId,{targetUrl:'https://self-'+host,justification:'Self-approval attempt for test'},fakeValidate);
+  await ta.verifyTargetAuthorization(manager,orgId,self.id,async()=>({observed:[self.challenge.recordValue as string],evidence:{}}));
+  await assert.rejects(ta.decideTargetAuthorization(manager,orgId,self.id,{decision:'APPROVE'}),/Separation of duties/);
+  await assert.rejects(pool.query("UPDATE target_authorizations SET status='APPROVED',decided_by=requested_by,decided_at=now(),expires_at=now()+interval '1 day' WHERE id=$1",[self.id]),/separation_of_duties/);
+  const ok=await ta.decideTargetAuthorization(manager,orgId,req.id,{decision:'APPROVE',note:'SOW verified'});
+  assert.equal(ok.status,'APPROVED');assert.ok(new Date(ok.expires_at).getTime()>Date.now()+80*86400e3);
+  const basis=await ta.assertTargetAuthorized(orgId,host.toUpperCase());assert.equal(basis.basis,'VERIFIED_AND_APPROVED');
+  await assert.rejects(ta.assertTargetAuthorized(orgId,'other.example.com'),/No approved/);
+  await ta.revokeTargetAuthorization(admin,orgId,req.id,'Engagement ended');
+  await assert.rejects(ta.assertTargetAuthorized(orgId,host),/No approved/,'revocation stops scans');
+  const actions=(await pool.query("SELECT action FROM audit_events WHERE payload->'metadata'->>'targetAuthorizationId'=$1 ORDER BY chain_seq",[req.id])).rows.map((r:any)=>r.action);
+  assert.deepEqual(actions,['TARGET_AUTHORIZATION_REQUESTED','TARGET_OWNERSHIP_VERIFICATION_FAILED','TARGET_OWNERSHIP_VERIFIED','TARGET_AUTHORIZATION_APPROVED','TARGET_AUTHORIZATION_REVOKED']);
+ }finally{if(prevMode===undefined)delete process.env.TARGET_AUTHORIZATION_MODE;else process.env.TARGET_AUTHORIZATION_MODE=prevMode;await pool.end()}
+});
+test('assessment authorization and every active URL scan consult the target authorization gate',async()=>{
+ const server=await readFile(new URL('../src/server.ts',import.meta.url),'utf8');
+ assert.match(server,/code:'TARGET_AUTHORIZATION_REQUIRED'/);
+ assert.match(server,/async function executeRealTool[^\n]*\n[^\n]*\n await assertTargetAuthorized\(await assessmentOrganizationId\(assessmentId\),t\.url\.hostname\);/);
+ const ui=await readFile(new URL('../public/target-authorization.js',import.meta.url),'utf8');
+ assert.doesNotMatch(ui,/innerHTML/);assert.match(ui,/globalThis\.openTargetAuthorizations=/);
+});

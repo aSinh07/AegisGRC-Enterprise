@@ -89,6 +89,8 @@ import {recoverInterruptedAssessments,maxFullAssessmentMs} from './assessment-re
 import {evidenceSigningKey,verifyEvidenceSignature} from './evidence-signing.js';
 import {pinnedAddress,withPinnedEgress,pinnedHttpGet} from './pinned-egress.js';
 import {scannerArgs,nucleiTemplatesPin} from './scanner-args.js';
+import {pool as dbPool} from './db-pool.js';
+import {requestTargetAuthorization,verifyTargetAuthorization,decideTargetAuthorization,revokeTargetAuthorization,listTargetAuthorizations,targetAuthorizationBasis,assertTargetAuthorized} from './target-authorization.js';
 import {verifyAuditChain,checkpointAuditChain,startAuditCheckpointer} from './audit-chain.js';
 import {initScannerJobs,enqueueScannerJob,listScannerJobs,claimScannerJob,recoverStaleScannerJobs,executeClaimedScannerJob,scannerRegistry} from './scanner-jobs.js';
 import { analyzeIntel } from './intel-ai.js';
@@ -635,6 +637,11 @@ function run(cmd:string,args:string[]){
     child.on('close',code=>{if(!done){done=true;clearTimeout(timer);resolve({stdout:out,stderr:err,exitCode:code,durationMs:Date.now()-started,timedOut,stdoutTruncated,stderrTruncated})}});
   });
 }
+app.get('/api/grc/organizations/:orgId/target-authorizations',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await listTargetAuthorizations(u.userId,req.params.orgId))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.post('/api/grc/organizations/:orgId/target-authorizations',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.status(201).json(await requestTargetAuthorization(u.userId,req.params.orgId,req.body||{}))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.post('/api/grc/organizations/:orgId/target-authorizations/:id/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const out=await verifyTargetAuthorization(u.userId,req.params.orgId,req.params.id);res.status(out.verified?200:409).json(out)}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.post('/api/grc/organizations/:orgId/target-authorizations/:id/decision',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await decideTargetAuthorization(u.userId,req.params.orgId,req.params.id,req.body||{}))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
+app.post('/api/grc/organizations/:orgId/target-authorizations/:id/revoke',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});res.json(await revokeTargetAuthorization(u.userId,req.params.orgId,req.params.id,String(req.body?.reason||'')))}catch(e:any){res.status(e.statusCode||400).json({error:e.message})}});
 app.get('/api/admin/audit-chain/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});if(!['grc_reviewer','admin'].includes(String(await userRole(u.userId))))return res.status(403).json({error:'Reviewer or admin role required'});const report=await verifyAuditChain();res.status(report.status==='BROKEN'?409:200).json(report)}catch(e:any){res.status(503).json({error:'Audit chain verification unavailable',detail:String(e?.message||e)})}});
 app.post('/api/admin/audit-chain/checkpoint',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});if(String(await userRole(u.userId))!=='admin')return res.status(403).json({error:'Admin role required'});res.json(await checkpointAuditChain())}catch(e:any){res.status(503).json({error:String(e?.message||e)})}});
 app.get('/api/assessments/:id/evidence/verify',async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const a=await db.assessmentForUser(u.userId,req.params.id);if(!a)return res.status(404).json({error:'Assessment not found'});const rows=await db.evidenceForAssessment(a.id);const results=rows.map(x=>({id:x.id,source:x.source,sha256:x.sha256,createdAt:x.createdAt,...verifyEvidenceSignature(x)}));const counts=results.reduce((m:any,x)=>{m[x.status]=(m[x.status]||0)+1;return m},{});res.status(results.some(x=>x.status==='INVALID')?409:200).json({assessmentId:a.id,total:results.length,counts,results})}catch(e:any){res.status(500).json({error:String(e?.message||e)})}});
@@ -663,10 +670,13 @@ app.post('/api/assessment/authorize',async(req,res)=>{
     const org=requestedOrg?orgs.find((x:any)=>x.id===requestedOrg):orgs.length===1?orgs[0]:null;
     if(!org)return res.status(409).json({error:'Select an organization for this assessment',organizations:orgs.map((x:any)=>({id:x.id,name:x.name,role:x.role}))});
     await requireOrgPermission(u.userId,org.id,'manageAssessment');
-    const assessment=(<Assessment&{createdBy:string;organizationId:string}>{id:crypto.randomUUID(),target:t.url.origin,authorizedAt:new Date().toISOString(),status:'AUTHORIZED',findings:[],evidenceIds:[],createdBy:u.userId,organizationId:org.id});
+    const basis=await targetAuthorizationBasis(org.id,t.url.hostname);
+    if(basis.mode==='enforce'&&!basis.authorization)return res.status(403).json({error:'This target has no approved ownership verification for '+org.name+'. Verify control of '+t.url.hostname+' and have a second approver sign off before scanning.',code:'TARGET_AUTHORIZATION_REQUIRED',organizationId:org.id,targetUrl:t.url.origin,hostname:t.url.hostname});
+    const authorizationBasis={mode:basis.mode,basis:basis.basis,targetAuthorizationId:basis.authorization?.id||null,approvedBy:basis.authorization?.decided_by||null,expiresAt:basis.authorization?.expires_at||null};
+    const assessment=(<Assessment&{createdBy:string;organizationId:string;authorizationBasis:typeof authorizationBasis}>{id:crypto.randomUUID(),target:t.url.origin,authorizedAt:new Date().toISOString(),status:'AUTHORIZED',findings:[],evidenceIds:[],createdBy:u.userId,organizationId:org.id,authorizationBasis});
     await db.saveAssessment(assessment);
     const sessionToken=issueSession(assessment.id,t.url.origin);
-    await db.saveAudit({id:crypto.randomUUID(),assessmentId:assessment.id,action:'ASSESSMENT_AUTHORIZED',actor:u.userId,createdAt:new Date().toISOString(),metadata:{target:t.url.origin,resolvedAddresses:t.addresses,organizationId:org.id}});
+    await db.saveAudit({id:crypto.randomUUID(),assessmentId:assessment.id,action:'ASSESSMENT_AUTHORIZED',actor:u.userId,createdAt:new Date().toISOString(),metadata:{target:t.url.origin,resolvedAddresses:t.addresses,organizationId:org.id,authorizationBasis}});
     res.json({authorized:true,assessmentId:assessment.id,targetOrigin:t.url.origin,resolvedAddresses:t.addresses,organization:{id:org.id,name:org.name},sessionToken});
   }catch(e:any){res.status(e.statusCode||400).json({error:e.message})}
 });
@@ -704,7 +714,10 @@ app.post('/api/architecture/document-model',upload.single('file'),async(req,res)
  }catch(e:any){res.status(400).json({error:e.message})}
 });
 app.post('/api/documents/security-scan',upload.single('file'),async(req,res)=>{try{const u=await currentUser(req);if(!u)return res.status(401).json({error:'User session required'});const file=req.file;if(!file)return res.status(400).json({error:'Choose a document'});if(file.size>20*1024*1024)return res.status(413).json({error:'20 MB maximum'});res.json(documentSecurityScan(file))}catch(e:any){res.status(400).json({error:e.message})}});
+async function assessmentOrganizationId(assessmentId:string){if(db.mode()!=='postgres')return null;return (await dbPool.query('SELECT organization_id FROM assessments WHERE id=$1',[assessmentId])).rows[0]?.organization_id||null}
 async function executeRealTool(tool:'nmap'|'wapiti'|'sqlmap'|'zap'|'nuclei',assessmentId:string,t:{url:URL,addresses:string[]},actor:string='system:scanner'){
+ // Every active URL scan re-checks that the target authorization is still approved and unexpired (revocation stops scans).
+ await assertTargetAuthorized(await assessmentOrganizationId(assessmentId),t.url.hostname);
  t=await revalidateTarget(t);
  const startedAt=new Date().toISOString();let result:{stdout:string;stderr:string;exitCode:number|null;durationMs:number;timedOut:boolean;stdoutTruncated:boolean;stderrTruncated:boolean};let zapAlerts:any[]=[];
  let egress:Record<string,unknown>;

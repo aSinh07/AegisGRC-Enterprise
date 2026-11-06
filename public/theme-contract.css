@@ -23,3 +23,18 @@ html .card,html .top,html .reviewitem,html .reviewstat{box-shadow:0 10px 28px va
 html[data-theme="light"] .side{background:#071525!important;color:#d7e4f2!important}
 html[data-theme="light"] .side .nav button{color:#b9c9da!important}html[data-theme="light"] .side .nav button.active,html[data-theme="light"] .side .nav button:hover{color:var(--accent)!important;background:#0a2235!important}
 .manager-theme select{background:var(--surface-2)!important;color:var(--text)!important;border:1px solid var(--line)!important}
+
+/* Target authorization panel (public/target-authorization.js) */
+.target-auth-panel{position:fixed;inset:0;z-index:1000;display:flex;align-items:flex-start;justify-content:center;padding:6vh 16px;background:rgba(10,14,24,.55);overflow:auto}
+.target-auth-panel[hidden]{display:none}
+.target-auth-card{width:min(760px,100%);background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:20px 22px;display:grid;gap:12px}
+.target-auth-form{display:grid;grid-template-columns:2fr 1fr;gap:8px}
+.target-auth-form input,.target-auth-form select{width:100%;min-width:0}
+.target-auth-form #taJustification{grid-column:1/-1}
+.target-auth-challenge[hidden]{display:none}
+.target-auth-challenge{border:1px dashed var(--accent);border-radius:10px;padding:12px;display:grid;gap:8px}
+.target-auth-challenge dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0}
+.target-auth-challenge dd{margin:0;overflow-wrap:anywhere}
+.target-auth-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--line)}
+.target-auth-row .mono,.target-auth-challenge .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media (max-width:560px){.target-auth-form{grid-template-columns:1fr}}
